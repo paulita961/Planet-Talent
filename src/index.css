@@ -1,0 +1,67 @@
+@import url('https://fonts.googleapis.com/css2?family=Alex+Brush&family=Bebas+Neue&family=Caveat:wght@400..700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600;1,700&family=Great+Vibes&family=Instrument+Serif:ital@1&family=Inter:wght@300;400;500;600;700;800;900&family=Kaushan+Script&family=Parisienne&family=Pinyon+Script&family=Plus+Jakarta+Sans:wght@700;800&family=Poppins:wght@300;400&family=Shadows+Into+Light&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Instrument Serif", "Playfair Display", "Cormorant Garamond", ui-serif, Georgia, serif;
+  --font-script: "Pinyon Script", "Great Vibes", "Alex Brush", "Parisienne", cursive;
+  --font-brush: "Kaushan Script", "Alex Brush", cursive;
+  --font-condensed: "Bebas Neue", sans-serif;
+  --font-handwriting: "Caveat", "Shadows Into Light", cursive;
+  --font-poppins: "Poppins", sans-serif;
+}
+
+.font-condensed {
+  font-family: "Bebas Neue", sans-serif;
+}
+
+.font-handwriting {
+  font-family: "Caveat", "Shadows Into Light", cursive;
+}
+
+.font-brush {
+  font-family: "Kaushan Script", "Alex Brush", cursive;
+}
+
+.font-script {
+  font-family: "Pinyon Script", "Great Vibes", "Alex Brush", "Parisienne", cursive;
+}
+
+@keyframes gentle-pulse {
+  0%, 100% {
+    scale: 1;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
+    border-color: rgba(204, 0, 0, 0.3);
+  }
+  50% {
+    scale: 1.1;
+    box-shadow: 0 0 18px rgba(204, 0, 0, 0.6);
+    border-color: rgba(204, 0, 0, 0.9);
+  }
+}
+
+.animate-gentle-pulse {
+  animation: gentle-pulse 2s infinite ease-in-out;
+}
+
+/* Custom Toast styling (Sonner override) */
+[data-sonner-toast] {
+  background-color: #0A0A0A !important;
+  color: #FFFFFF !important;
+  border: 1px solid rgba(204, 0, 0, 0.4) !important;
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.9), 0 0 20px rgba(204, 0, 0, 0.2) !important;
+  border-radius: 4px !important;
+}
+
+[data-sonner-toast] [data-title] {
+  color: #FFFFFF !important;
+  font-weight: 500 !important;
+}
+
+[data-sonner-toast] [data-description] {
+  color: #A0A0A0 !important;
+}
+
+[data-sonner-toast] [data-icon] {
+  color: #CC0000 !important;
+}

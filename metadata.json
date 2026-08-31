@@ -1,0 +1,6 @@
+{
+  "name": "Planet Talent",
+  "description": "Agencia de modelos y talentos de alta costura. Descubre nuestro portafolio con filtros interactivos, fotografías y fichas técnicas en español.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

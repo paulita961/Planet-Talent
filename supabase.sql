@@ -107,37 +107,63 @@ CREATE TABLE IF NOT EXISTS casting_applications (
   id serial primary key,
   nombre text not null,
   apellidos text not null,
-  fecha_nacimiento date not null,
+  fecha_nacimiento date,
   edad integer not null check (edad >= 17),
   ciudad text not null,
   whatsapp text not null,
   correo text not null,
   instagram text not null,
-  estatura integer not null,
+  estatura integer,
   busto integer,
   cintura integer,
   caderas integer,
-  talla_superior text not null,
-  talla_inferior text not null,
-  calzado text not null,
-  color_cabello text not null,
-  largo_cabello text not null,
-  color_ojos text not null,
-  tono_piel text not null,
+  talla_superior text,
+  talla_inferior text,
+  calzado text,
+  color_cabello text,
+  largo_cabello text,
+  color_ojos text,
+  tono_piel text,
   tiene_piercings boolean default false,
   tiene_tatuajes boolean default false,
   detalle_piercings_tatuajes text,
   foto_cara text,
   foto_cuerpo text,
+  origen text default 'web', -- 'web' | 'google_form'
+  nombre_artistico text,
+  estado_cabello text,
+  tiktok text,
+  notas_importacion text,
+  datos_incompletos boolean default false,
+  campos_faltantes text[],
   estado text default 'pendiente', -- 'pendiente', 'preseleccionada', 'seleccionada', 'descartada'
   created_at timestamp with time zone default now()
 );
 
--- Migración segura si casting_applications ya existía sin foto_cara / foto_cuerpo:
+-- Migración segura si casting_applications ya existía:
 ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS foto_cara text;
 ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS foto_cuerpo text;
 ALTER TABLE casting_applications ALTER COLUMN foto_cara DROP NOT NULL;
 ALTER TABLE casting_applications ALTER COLUMN foto_cuerpo DROP NOT NULL;
+
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS origen text default 'web';
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS nombre_artistico text;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS estado_cabello text;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS tiktok text;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS notas_importacion text;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS datos_incompletos boolean default false;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS campos_faltantes text[];
+
+ALTER TABLE casting_applications ALTER COLUMN fecha_nacimiento DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN estatura DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN talla_superior DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN talla_inferior DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN calzado DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN color_cabello DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN largo_cabello DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN color_ojos DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN tono_piel DROP NOT NULL;
+
 NOTIFY pgrst, 'reload schema';
 
 -- 8. Row Level Security (RLS) for casting_applications:

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'planet-talent-casting-v36';
+const CACHE_NAME = 'planet-talent-casting-v37';
 const OFFLINE_URL = '/';
 const CASTING_URL = '/casting';
 const CASTING_VIDEO_PATH = '/assets/aistudio/Casting_Planet_2c988d68.mp4';

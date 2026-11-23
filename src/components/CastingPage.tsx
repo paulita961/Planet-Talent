@@ -55,6 +55,7 @@ const LOWER_SIZES = ['XS', 'S', 'M', 'L', 'XL'];
 const SHOE_SIZES = ['36', '37', '38', '39', '40', '41', 'Otro'];
 const HAIR_COLORS = ['Rubio', 'Negro', 'Castaño', 'Rojo', 'Otro'];
 const HAIR_LENGTHS = ['Corto', 'Medio', 'Largo', 'Otro'];
+const HAIR_CONDITIONS = ['Natural', 'Teñido'];
 const EYE_COLORS = ['Azules', 'Verdes', 'Carmelitas', 'Negros', 'Otro'];
 const SKIN_TONES = ['Blanca', 'Morena', 'Mulata', 'Negra', 'Otro'];
 
@@ -177,10 +178,12 @@ export const CastingPage: React.FC<CastingPageProps> = ({
   const [nombre, setNombre] = useState('');
   const [apellidos, setApellidos] = useState('');
   const [fechaNacimiento, setFechaNacimiento] = useState('');
+  const [nombreArtistico, setNombreArtistico] = useState('');
   const [ciudad, setCiudad] = useState('');
   const [whatsapp, setWhatsapp] = useState('');
   const [correo, setCorreo] = useState('');
   const [instagram, setInstagram] = useState('');
+  const [tiktok, setTiktok] = useState('');
 
   // Step 2
   const [estatura, setEstatura] = useState('');
@@ -197,6 +200,8 @@ export const CastingPage: React.FC<CastingPageProps> = ({
   const [colorCabelloOtro, setColorCabelloOtro] = useState('');
   const [largoCabello, setLargoCabello] = useState('');
   const [largoCabelloOtro, setLargoCabelloOtro] = useState('');
+  const [estadoCabello, setEstadoCabello] = useState('');
+  const [disposicionCambios, setDisposicionCambios] = useState(false);
   const [colorOjos, setColorOjos] = useState('');
   const [colorOjosOtro, setColorOjosOtro] = useState('');
   const [tonoPiel, setTonoPiel] = useState('');
@@ -314,6 +319,19 @@ export const CastingPage: React.FC<CastingPageProps> = ({
     return `@${cleaned}`;
   };
 
+  const formatTikTokInput = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    const withoutUrl = trimmed
+      .replace(/^https?:\/\/(www\.|vm\.)?tiktok\.com\/@?/i, '')
+      .split(/[/?#]/)[0];
+    const cleaned = withoutUrl.replace(/^@+/, '').replace(/\s+/g, '');
+    if (!cleaned) {
+      return raw.includes('@') ? '@' : '';
+    }
+    return `@${cleaned}`;
+  };
+
   const validateStep2 = (): string | null => {
     const h = Number(estatura);
     if (!estatura.trim() || Number.isNaN(h) || h < 120 || h > 220) {
@@ -341,6 +359,9 @@ export const CastingPage: React.FC<CastingPageProps> = ({
     }
     if (!largoCabello || (largoCabello === 'Otro' && !largoCabelloOtro.trim())) {
       return lang === 'es' ? 'Indica el largo de tu cabello.' : 'Select your hair length.';
+    }
+    if (!estadoCabello) {
+      return lang === 'es' ? 'Indica el estado de tu cabello (Natural o Teñido).' : 'Select your hair condition (Natural or Dyed).';
     }
     if (!colorOjos || (colorOjos === 'Otro' && !colorOjosOtro.trim())) {
       return lang === 'es' ? 'Indica tu color de ojos.' : 'Select your eye color.';
@@ -522,10 +543,15 @@ export const CastingPage: React.FC<CastingPageProps> = ({
         createdAt: new Date().toISOString(),
       });
 
+      const finalEstadoCabello = disposicionCambios
+        ? `${estadoCabello} · Disposición a cambios`
+        : estadoCabello;
+      const cleanTiktokRaw = tiktok.replace(/^@+/, '').trim();
+      const normalizedTiktok = cleanTiktokRaw ? `@${cleanTiktokRaw}` : null;
+
       // 2. Insertar ficha en Supabase (SIN .select() para respetar RLS insert-only para anónimos).
-      // Si la tabla en Supabase aún no tiene las columnas foto_cara / foto_cuerpo en su caché de esquema,
-      // reintenta automáticamente sin esas columnas ya que las fotos quedan guardadas en almacenamiento local.
-      const baseApplicationPayload = {
+      // Si la tabla aún no tiene las columnas nuevas en su caché de esquema, reintenta de forma segura sin ellas.
+      const coreApplicationPayload = {
         nombre: nombre.trim(),
         apellidos: apellidos.trim(),
         fecha_nacimiento: fechaNacimiento,
@@ -552,24 +578,48 @@ export const CastingPage: React.FC<CastingPageProps> = ({
         estado: 'pendiente',
       };
 
-      let { error: dbError } = await supabase.from('casting_applications').insert([
-        {
-          ...baseApplicationPayload,
-          foto_cara: localCaraUrl,
-          foto_cuerpo: localCuerpoUrl,
-        },
-      ]);
+      const extendedPayload = {
+        ...coreApplicationPayload,
+        foto_cara: localCaraUrl,
+        foto_cuerpo: localCuerpoUrl,
+        origen: 'web',
+        nombre_artistico: nombreArtistico.trim() || null,
+        estado_cabello: finalEstadoCabello,
+        tiktok: normalizedTiktok,
+        datos_incompletos: false,
+        campos_faltantes: [] as string[],
+      };
+
+      let { error: dbError } = await supabase.from('casting_applications').insert([extendedPayload]);
 
       if (
         dbError &&
         (dbError.code === 'PGRST204' ||
           dbError.code === '42703' ||
-          /foto_cara|foto_cuerpo|schema cache|column/i.test(dbError.message || ''))
+          /foto_cara|foto_cuerpo|origen|nombre_artistico|estado_cabello|tiktok|datos_incompletos|campos_faltantes|schema cache|column/i.test(
+            dbError.message || ''
+          ))
       ) {
-        const retryRes = await supabase
-          .from('casting_applications')
-          .insert([baseApplicationPayload]);
-        dbError = retryRes.error;
+        const retryWithPhotos = await supabase.from('casting_applications').insert([
+          {
+            ...coreApplicationPayload,
+            foto_cara: localCaraUrl,
+            foto_cuerpo: localCuerpoUrl,
+          },
+        ]);
+        dbError = retryWithPhotos.error;
+
+        if (
+          dbError &&
+          (dbError.code === 'PGRST204' ||
+            dbError.code === '42703' ||
+            /foto_cara|foto_cuerpo|schema cache|column/i.test(dbError.message || ''))
+        ) {
+          const retryCore = await supabase
+            .from('casting_applications')
+            .insert([coreApplicationPayload]);
+          dbError = retryCore.error;
+        }
       }
 
       if (dbError) {
@@ -1206,6 +1256,20 @@ export const CastingPage: React.FC<CastingPageProps> = ({
                       </div>
                     </div>
 
+                    <div>
+                      <label className="block text-[11px] sm:text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-1 sm:mb-1.5">
+                        {lang === 'es' ? 'Nombre artístico (si tiene)' : 'Stage Name (optional)'}
+                      </label>
+                      <input
+                        id="casting-artistic-name-input"
+                        type="text"
+                        value={nombreArtistico}
+                        onChange={(e) => setNombreArtistico(e.target.value)}
+                        placeholder={lang === 'es' ? 'Ej. Cami Pérez (opcional)' : 'Optional'}
+                        className="w-full h-10 sm:h-11 px-3.5 bg-[#0D0D10] border border-white/20 rounded-sm text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
+                      />
+                    </div>
+
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
                       <div>
                         <label className="block text-[11px] sm:text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-1 sm:mb-1.5">
@@ -1290,25 +1354,47 @@ export const CastingPage: React.FC<CastingPageProps> = ({
                       </div>
                     </div>
 
-                    <div>
-                      <label className="block text-[11px] sm:text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-1 sm:mb-1.5">
-                        Instagram *
-                      </label>
-                      <input
-                        id="casting-instagram-input"
-                        type="text"
-                        required
-                        value={instagram}
-                        onFocus={() => {
-                          if (!instagram) setInstagram('@');
-                        }}
-                        onBlur={() => {
-                          if (instagram.trim() === '@') setInstagram('');
-                        }}
-                        onChange={(e) => setInstagram(formatInstagramInput(e.target.value))}
-                        placeholder="@tu_usuario"
-                        className="w-full h-10 sm:h-11 px-3.5 bg-[#0D0D10] border border-white/20 rounded-sm text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
-                      />
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+                      <div>
+                        <label className="block text-[11px] sm:text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-1 sm:mb-1.5">
+                          Instagram *
+                        </label>
+                        <input
+                          id="casting-instagram-input"
+                          type="text"
+                          required
+                          value={instagram}
+                          onFocus={() => {
+                            if (!instagram) setInstagram('@');
+                          }}
+                          onBlur={() => {
+                            if (instagram.trim() === '@') setInstagram('');
+                          }}
+                          onChange={(e) => setInstagram(formatInstagramInput(e.target.value))}
+                          placeholder="@tu_usuario"
+                          className="w-full h-10 sm:h-11 px-3.5 bg-[#0D0D10] border border-white/20 rounded-sm text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] sm:text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-1 sm:mb-1.5">
+                          TikTok ({lang === 'es' ? 'opcional' : 'optional'})
+                        </label>
+                        <input
+                          id="casting-tiktok-input"
+                          type="text"
+                          value={tiktok}
+                          onFocus={() => {
+                            if (!tiktok) setTiktok('@');
+                          }}
+                          onBlur={() => {
+                            if (tiktok.trim() === '@') setTiktok('');
+                          }}
+                          onChange={(e) => setTiktok(formatTikTokInput(e.target.value))}
+                          placeholder="@tu_tiktok"
+                          className="w-full h-10 sm:h-11 px-3.5 bg-[#0D0D10] border border-white/20 rounded-sm text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
+                        />
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1536,6 +1622,41 @@ export const CastingPage: React.FC<CastingPageProps> = ({
                           className="mt-2.5 w-full h-11 px-3.5 bg-[#0D0D10] border border-white/20 rounded-sm text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
                         />
                       )}
+                    </div>
+
+                    <div>
+                      <label className="block text-xs uppercase tracking-wider text-zinc-200 font-semibold mb-2">
+                        {lang === 'es' ? 'Estado del cabello *' : 'Hair Condition *'}
+                      </label>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 w-full">
+                        {HAIR_CONDITIONS.map((opt) => (
+                          <button
+                            key={opt}
+                            type="button"
+                            onClick={() => setEstadoCabello(opt)}
+                            className={`w-full h-11 px-3 rounded-sm text-xs font-semibold border transition-colors cursor-pointer ${
+                              estadoCabello === opt
+                                ? 'bg-[#E2BA57]/15 border-[#E2BA57] text-[#FCE99F]'
+                                : 'bg-[#0D0D10] border-white/20 text-zinc-200 hover:border-white/40'
+                            }`}
+                          >
+                            {lang === 'es' ? opt : opt === 'Natural' ? 'Natural' : 'Dyed'}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => setDisposicionCambios((v) => !v)}
+                          aria-pressed={disposicionCambios}
+                          className={`w-full h-11 px-3 rounded-sm text-xs font-semibold border transition-colors cursor-pointer flex items-center justify-center gap-1.5 ${
+                            disposicionCambios
+                              ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                              : 'bg-[#0D0D10] border-white/20 text-zinc-300 hover:border-white/40'
+                          }`}
+                        >
+                          {disposicionCambios && <Check className="w-3.5 h-3.5 shrink-0" />}
+                          <span>{lang === 'es' ? 'Disposición a cambios' : 'Open to changes'}</span>
+                        </button>
+                      </div>
                     </div>
 
                     <div>

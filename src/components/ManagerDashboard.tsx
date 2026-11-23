@@ -58,7 +58,9 @@ import {
   Sparkle,
   Zap,
   CloudUpload,
-  HardDrive
+  HardDrive,
+  FileSpreadsheet,
+  Download
 } from 'lucide-react';
 import { resolvePhoto, calculateAge, formatDate, getModelLevel, getModelBio, ModelLevelBadge, formatUpdatedAgo, formatFollowersDisplay, isModelNew, isModelFeatured, NewModelRibbon } from '../App';
 import { 
@@ -83,6 +85,13 @@ import {
   LocalCastingPhotoRecord,
   matchLocalPhotosToApplication,
 } from '../lib/castingLocalPhotos';
+import {
+  buildDiscardedCsvContent,
+  findExistingDuplicateInDb,
+  NormalizationResult,
+  normalizeGoogleFormsCastingCsv,
+  NormalizedCastingInsert,
+} from '../lib/castingCsvNormalizer';
 
 const protectedPhotoBlobCache = new Map<string, string>();
 
@@ -258,6 +267,8 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
   const [loadingCasting, setLoadingCasting] = useState<boolean>(false);
   const [castingError, setCastingError] = useState<string>('');
   const [castingStatusFilter, setCastingStatusFilter] = useState<'all' | CastingApplicationStatus>('all');
+  const [castingOriginFilter, setCastingOriginFilter] = useState<'all' | 'web' | 'google_form' | 'missing_photos' | 'incomplete'>('all');
+  const [castingSearchQuery, setCastingSearchQuery] = useState<string>('');
   const [castingSubView, setCastingSubView] = useState<'applicants' | 'schedule'>('applicants');
   const [rosterScope, setRosterScope] = useState<'attending' | 'pre_selected' | 'selected' | 'all'>('attending');
   const [rosterSort, setRosterSort] = useState<'arrival' | 'alpha'>('arrival');
@@ -269,6 +280,16 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
   const [previewCastingPhotos, setPreviewCastingPhotos] = useState<{ cara: string; cuerpo: string; nombre: string } | null>(null);
   const [updatingCastingId, setUpdatingCastingId] = useState<number | null>(null);
   const [castingStatus, setCastingStatus] = useState(() => getCastingStatusInfo());
+
+  // CSV Import State (Google Form)
+  const [showCsvImportModal, setShowCsvImportModal] = useState<boolean>(false);
+  const [csvFileName, setCsvFileName] = useState<string>('');
+  const [csvImportResult, setCsvImportResult] = useState<NormalizationResult | null>(null);
+  const [csvReadyToInsert, setCsvReadyToInsert] = useState<NormalizedCastingInsert[]>([]);
+  const [csvExistingDupCount, setCsvExistingDupCount] = useState<number>(0);
+  const [importingCsv, setImportingCsv] = useState<boolean>(false);
+  const [csvImportProgress, setCsvImportProgress] = useState<{ inserted: number; total: number } | null>(null);
+  const [csvImportDone, setCsvImportDone] = useState<boolean>(false);
 
   useEffect(() => {
     const syncCasting = () => setCastingStatus(getCastingStatusInfo());
@@ -687,6 +708,100 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
     }
   };
 
+  const handleCsvFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const result = normalizeGoogleFormsCastingCsv(text);
+      let dupInDb = 0;
+      const toInsert: NormalizedCastingInsert[] = [];
+      for (const rec of result.validRecords) {
+        if (findExistingDuplicateInDb(rec, castingApplications)) {
+          dupInDb++;
+        } else {
+          toInsert.push(rec);
+        }
+      }
+      setCsvFileName(file.name);
+      setCsvImportResult(result);
+      setCsvReadyToInsert(toInsert);
+      setCsvExistingDupCount(dupInDb);
+      setCsvImportProgress(null);
+      setCsvImportDone(false);
+    } catch (err: any) {
+      toast.error(err?.message || 'No se pudo leer el archivo CSV');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleDownloadDiscardedCsv = () => {
+    if (!csvImportResult || csvImportResult.discardedRecords.length === 0) {
+      toast.info('No hay casos descartados para descargar');
+      return;
+    }
+    const csvContent = buildDiscardedCsvContent(csvImportResult.discardedRecords);
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'casting_descartados_y_observados.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast.success(`Descargado listado con ${csvImportResult.discardedRecords.length} casos descartados/observados`);
+  };
+
+  const handleConfirmCsvImport = async () => {
+    if (importingCsv || csvReadyToInsert.length === 0) return;
+    setImportingCsv(true);
+    const total = csvReadyToInsert.length;
+    setCsvImportProgress({ inserted: 0, total });
+    const toastId = toast.loading(`Importando ${total} candidatas normalizadas a Supabase...`);
+
+    try {
+      const BATCH_SIZE = 40;
+      let insertedCount = 0;
+      for (let i = 0; i < total; i += BATCH_SIZE) {
+        const batch = csvReadyToInsert.slice(i, i + BATCH_SIZE);
+        const { error } = await supabase.from('casting_applications').insert(batch);
+        if (error) {
+          if (
+            error.code === 'PGRST204' ||
+            error.code === '42703' ||
+            error.code === '23502' ||
+            /column|schema cache|null value in column/i.test(error.message || '')
+          ) {
+            throw new Error(
+              'Debes ejecutar primero la actualización de casting_applications del archivo supabase.sql en tu SQL Editor de Supabase (para agregar las columnas nuevas y permitir valores nulos en datos físicos).'
+            );
+          }
+          throw error;
+        }
+        insertedCount += batch.length;
+        setCsvImportProgress({ inserted: insertedCount, total });
+      }
+
+      setCsvImportDone(true);
+      setCsvReadyToInsert([]);
+      toast.success(`Se importaron ${insertedCount} modelos únicas a Supabase.`, {
+        id: toastId,
+        duration: 6000,
+      });
+      await fetchCastingApplications(true);
+    } catch (err: any) {
+      console.error('CSV import error:', err);
+      toast.error(err?.message || 'Error al importar lote en Supabase', {
+        id: toastId,
+        duration: 8000,
+      });
+    } finally {
+      setImportingCsv(false);
+    }
+  };
+
   // Estadísticas, Listado de asistencia y Horario automático de Casting (28 y 29 Nov)
   const castingCounts = React.useMemo(() => {
     const total = castingApplications.length;
@@ -696,8 +811,37 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
     const descartadas = castingApplications.filter((a) => a.estado === 'descartada').length;
     const asistentes = total - descartadas;
     const conTutor = castingApplications.filter((a) => a.edad === 17 && a.estado !== 'descartada').length;
-    return { total, pendientes, preseleccionadas, seleccionadas, descartadas, asistentes, conTutor };
+    const sinFotos = castingApplications.filter((a) => !a.foto_cara && !a.foto_cuerpo).length;
+    const deGoogleForm = castingApplications.filter((a) => a.origen === 'google_form').length;
+    return { total, pendientes, preseleccionadas, seleccionadas, descartadas, asistentes, conTutor, sinFotos, deGoogleForm };
   }, [castingApplications]);
+
+  const filteredCastingApplications = React.useMemo(() => {
+    const q = castingSearchQuery.trim().toLowerCase();
+    return castingApplications.filter((a) => {
+      if (castingStatusFilter !== 'all' && a.estado !== castingStatusFilter) return false;
+      if (castingOriginFilter === 'web' && a.origen === 'google_form') return false;
+      if (castingOriginFilter === 'google_form' && a.origen !== 'google_form') return false;
+      if (castingOriginFilter === 'missing_photos' && (a.foto_cara || a.foto_cuerpo)) return false;
+      if (castingOriginFilter === 'incomplete' && !a.datos_incompletos) return false;
+      if (q) {
+        const haystack = [
+          a.nombre,
+          a.apellidos,
+          a.nombre_artistico || '',
+          a.ciudad,
+          a.whatsapp,
+          a.correo,
+          a.instagram,
+          a.tiktok || '',
+        ]
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [castingApplications, castingStatusFilter, castingOriginFilter, castingSearchQuery]);
 
   const scheduledCastingRoster = React.useMemo(() => {
     let list = castingApplications.filter((app) => {
@@ -3266,12 +3410,20 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                   </button>
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowCsvImportModal(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#E2BA57]/15 hover:bg-[#E2BA57]/25 border border-[#E2BA57]/40 rounded-sm text-xs font-semibold text-[#FCE99F] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Importar CSV (Google Form)</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => fetchCastingApplications(false)}
                     disabled={loadingCasting}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm text-xs text-white/90 transition-colors cursor-pointer disabled:opacity-50"
+                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm text-xs text-white/90 transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${loadingCasting ? 'animate-spin text-[#CC0000]' : ''}`} />
                     <span>Actualizar</span>
@@ -3280,35 +3432,81 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
               </div>
 
               {castingSubView === 'applicants' && (
-                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar bg-[#0A0A0A] border border-white/10 p-3 rounded-sm">
-                  {(
-                    [
-                      { value: 'all', label: 'Todas' },
-                      { value: 'pendiente', label: 'Pendiente' },
-                      { value: 'preseleccionada', label: 'Preseleccionada' },
-                      { value: 'seleccionada', label: 'Seleccionada' },
-                      { value: 'descartada', label: 'Descartada' },
-                    ] as const
-                  ).map((opt) => {
-                    const count =
-                      opt.value === 'all'
-                        ? castingApplications.length
-                        : castingApplications.filter((a) => a.estado === opt.value).length;
-                    return (
+                <div className="bg-[#0A0A0A] border border-white/10 p-3 rounded-sm space-y-2.5">
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5">
+                    <div className="flex items-center gap-1.5 overflow-x-auto pb-1 lg:pb-0 no-scrollbar">
+                      {(
+                        [
+                          { value: 'all', label: 'Todas' },
+                          { value: 'pendiente', label: 'Pendiente' },
+                          { value: 'preseleccionada', label: 'Preseleccionada' },
+                          { value: 'seleccionada', label: 'Seleccionada' },
+                          { value: 'descartada', label: 'Descartada' },
+                        ] as const
+                      ).map((opt) => {
+                        const count =
+                          opt.value === 'all'
+                            ? castingApplications.length
+                            : castingApplications.filter((a) => a.estado === opt.value).length;
+                        return (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            onClick={() => setCastingStatusFilter(opt.value)}
+                            className={`px-3 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider transition-all border shrink-0 whitespace-nowrap cursor-pointer ${
+                              castingStatusFilter === opt.value
+                                ? 'bg-[#8B1A1A] border-[#A82525]/40 text-white shadow-sm'
+                                : 'bg-white/5 border-white/10 hover:border-white/20 text-[#A0A0A0] hover:text-white'
+                            }`}
+                          >
+                            {opt.label} ({count})
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="relative w-full lg:w-72 shrink-0">
+                      <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={castingSearchQuery}
+                        onChange={(e) => setCastingSearchQuery(e.target.value)}
+                        placeholder="Buscar nombre, @IG, WhatsApp..."
+                        className="w-full h-9 pl-8 pr-3 bg-[#141418] border border-white/15 rounded-sm text-xs text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#E2BA57]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 overflow-x-auto pt-2 border-t border-white/5 no-scrollbar">
+                    <span className="text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mr-1 shrink-0">
+                      Origen / Ficha:
+                    </span>
+                    {(
+                      [
+                        { value: 'all', label: `Todas (${castingCounts.total})` },
+                        { value: 'web', label: `Web (${castingCounts.total - castingCounts.deGoogleForm})` },
+                        { value: 'google_form', label: `Google Form (${castingCounts.deGoogleForm})` },
+                        { value: 'missing_photos', label: `Sin fotos (${castingCounts.sinFotos})` },
+                        {
+                          value: 'incomplete',
+                          label: `Datos faltantes (${castingApplications.filter((a) => a.datos_incompletos).length})`,
+                        },
+                      ] as const
+                    ).map((opt) => (
                       <button
                         key={opt.value}
                         type="button"
-                        onClick={() => setCastingStatusFilter(opt.value)}
-                        className={`px-3 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider transition-all border shrink-0 whitespace-nowrap cursor-pointer ${
-                          castingStatusFilter === opt.value
-                            ? 'bg-[#8B1A1A] border-[#A82525]/40 text-white shadow-sm'
-                            : 'bg-white/5 border-white/10 hover:border-white/20 text-[#A0A0A0] hover:text-white'
+                        onClick={() => setCastingOriginFilter(opt.value)}
+                        className={`px-2.5 py-1 rounded-sm text-[11px] font-medium border shrink-0 whitespace-nowrap transition-colors cursor-pointer ${
+                          castingOriginFilter === opt.value
+                            ? 'bg-white/15 border-white/35 text-white'
+                            : 'bg-transparent border-white/10 text-zinc-400 hover:text-zinc-200'
                         }`}
                       >
-                        {opt.label} ({count})
+                        {opt.label}
                       </button>
-                    );
-                  })}
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -3518,7 +3716,7 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                                   )}
                                 </td>
                                 <td className="py-3 px-4 text-zinc-300 tabular-nums whitespace-nowrap">
-                                  {item.app.estatura} cm
+                                  {item.app.estatura ? `${item.app.estatura} cm` : 'Pendiente'}
                                 </td>
                                 <td className="py-3 px-4 text-zinc-300 whitespace-nowrap">
                                   {item.app.whatsapp} · {item.app.instagram}
@@ -3536,23 +3734,21 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                     </div>
                   )}
                 </div>
-              ) : castingApplications.filter(
-                  (a) => castingStatusFilter === 'all' || a.estado === castingStatusFilter
-                ).length === 0 ? (
+              ) : filteredCastingApplications.length === 0 ? (
                 <div className="bg-[#0A0A0A] border border-white/10 rounded-sm p-14 text-center space-y-2">
                   <Sparkles className="w-8 h-8 text-zinc-500 mx-auto" />
                   <p className="text-sm font-medium text-white">No hay postulantes en esta vista</p>
                   <p className="text-xs text-zinc-400">
-                    Las candidatas que completen el formulario en #casting aparecerán aquí.
+                    Ajusta los filtros o importa el listado de Google Form para visualizar las candidatas.
                   </p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-4">
-                  {castingApplications
-                    .filter((a) => castingStatusFilter === 'all' || a.estado === castingStatusFilter)
-                    .map((app) => {
-                      const cleanWa = app.whatsapp.replace(/[^0-9]/g, '');
-                      const igClean = app.instagram.replace(/^@/, '').trim();
+                  {filteredCastingApplications.map((app) => {
+                      const cleanWa = (app.whatsapp || '').replace(/[^0-9]/g, '');
+                      const igClean = (app.instagram || '').replace(/^@/, '').trim();
+                      const hasValidIg = Boolean(igClean && igClean.toLowerCase() !== 'no especificado');
+                      const tkClean = (app.tiktok || '').replace(/^@/, '').trim();
                       const createdFormatted = app.created_at
                         ? new Date(app.created_at).toLocaleDateString('es-ES', {
                             day: '2-digit',
@@ -3623,8 +3819,39 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                                   )}
                                 </div>
                                 <p className="text-xs text-zinc-400 mt-1">
-                                  {app.ciudad} · {app.edad} años ({app.fecha_nacimiento}) · Postulada: {createdFormatted}
+                                  {app.ciudad} · {app.edad} años ({app.fecha_nacimiento || 'Fecha por confirmar'}) ·{' '}
+                                  {app.origen === 'google_form' ? 'Google Form' : 'Web'} · {createdFormatted}
                                 </p>
+                                {(app.nombre_artistico || app.tiktok || app.datos_incompletos) && (
+                                  <p className="text-xs text-zinc-300 mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                    {app.nombre_artistico && (
+                                      <span>
+                                        Artístico: <strong className="text-white">{app.nombre_artistico}</strong>
+                                      </span>
+                                    )}
+                                    {tkClean && (
+                                      <>
+                                        {app.nombre_artistico && <span aria-hidden="true">·</span>}
+                                        <a
+                                          href={`https://tiktok.com/@${encodeURIComponent(tkClean)}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-zinc-200 hover:text-white hover:underline"
+                                        >
+                                          TikTok: @{tkClean}
+                                        </a>
+                                      </>
+                                    )}
+                                    {app.datos_incompletos && app.campos_faltantes && app.campos_faltantes.length > 0 && (
+                                      <>
+                                        {(app.nombre_artistico || tkClean) && <span aria-hidden="true">·</span>}
+                                        <span className="text-amber-300">
+                                          Falta: {app.campos_faltantes.join(', ')}
+                                        </span>
+                                      </>
+                                    )}
+                                  </p>
+                                )}
                                 {(app.foto_cara || app.foto_cuerpo) && (
                                   <button
                                     type="button"
@@ -3644,24 +3871,24 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                               </div>
                             </div>
 
-                            <div className="flex items-center gap-2">
-                              {cleanWa && (
+                            <div className="flex items-center gap-2 shrink-0">
+                              {cleanWa.length >= 7 && (
                                 <a
                                   href={`https://wa.me/${cleanWa}`}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-sm text-xs font-medium"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-sm text-xs font-medium whitespace-nowrap"
                                 >
                                   <WhatsAppIcon className="w-3.5 h-3.5" />
                                   <span>{app.whatsapp}</span>
                                 </a>
                               )}
-                              {igClean && (
+                              {hasValidIg && (
                                 <a
                                   href={`https://instagram.com/${encodeURIComponent(igClean)}`}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/15 rounded-sm text-xs font-medium"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/15 rounded-sm text-xs font-medium whitespace-nowrap"
                                 >
                                   <Instagram className="w-3.5 h-3.5 text-[#FF6B6B]" />
                                   <span>@{igClean}</span>
@@ -3674,8 +3901,16 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                           <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5 p-3 bg-black/50 border border-white/5 rounded-sm text-xs">
                             <div>
                               <span className="text-[10px] uppercase text-zinc-400 block">Estatura</span>
-                              <span className={`font-semibold tabular-nums ${app.estatura < 165 ? 'text-amber-300' : 'text-white'}`}>
-                                {app.estatura} cm
+                              <span
+                                className={`font-semibold tabular-nums ${
+                                  app.estatura !== null && app.estatura < 165
+                                    ? 'text-amber-300'
+                                    : app.estatura === null
+                                    ? 'text-zinc-400'
+                                    : 'text-white'
+                                }`}
+                              >
+                                {app.estatura !== null ? `${app.estatura} cm` : 'Pendiente'}
                               </span>
                             </div>
                             <div>
@@ -3687,19 +3922,20 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                             <div>
                               <span className="text-[10px] uppercase text-zinc-400 block">Tallas / Calzado</span>
                               <span className="font-semibold text-white">
-                                {app.talla_superior} · {app.talla_inferior} · #{app.calzado}
+                                {app.talla_superior || '—'} · {app.talla_inferior || '—'} · #{app.calzado || '—'}
                               </span>
                             </div>
                             <div>
                               <span className="text-[10px] uppercase text-zinc-400 block">Cabello</span>
                               <span className="font-semibold text-white">
-                                {app.color_cabello} ({app.largo_cabello})
+                                {app.color_cabello || '—'} ({app.largo_cabello || '—'})
+                                {app.estado_cabello ? ` · ${app.estado_cabello}` : ''}
                               </span>
                             </div>
                             <div>
                               <span className="text-[10px] uppercase text-zinc-400 block">Ojos / Piel</span>
                               <span className="font-semibold text-white">
-                                {app.color_ojos} · {app.tono_piel}
+                                {app.color_ojos || '—'} · {app.tono_piel || '—'}
                               </span>
                             </div>
                             <div>
@@ -3715,6 +3951,13 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                             <p className="text-xs text-zinc-300 bg-white/[0.02] border border-white/5 p-2.5 rounded-sm">
                               <strong className="text-white">Detalle piercings/tatuajes:</strong>{' '}
                               {app.detalle_piercings_tatuajes}
+                            </p>
+                          )}
+
+                          {app.notas_importacion && (
+                            <p className="text-xs text-zinc-400 bg-white/[0.02] border border-white/5 p-2.5 rounded-sm">
+                              <strong className="text-zinc-200">Notas de normalización:</strong>{' '}
+                              {app.notas_importacion}
                             </p>
                           )}
 
@@ -5454,6 +5697,171 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                   </div>
                 </div>
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL IMPORTADOR CSV DE GOOGLE FORMS */}
+      <AnimatePresence>
+        {showCsvImportModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-xl"
+            onClick={() => !importingCsv && setShowCsvImportModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.96, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.96, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[#0A0A0A] border border-white/15 rounded-sm p-6 max-w-2xl w-full relative space-y-5 max-h-[90vh] overflow-y-auto"
+            >
+              <button
+                type="button"
+                disabled={importingCsv}
+                onClick={() => setShowCsvImportModal(false)}
+                className="absolute top-4 right-4 p-2 text-zinc-400 hover:text-white transition-colors cursor-pointer disabled:opacity-40"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <div className="space-y-1 pr-8">
+                <h3 className="text-lg font-bold text-white">
+                  Importador y Normalizador CSV (Google Form)
+                </h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">
+                  Procesa solo modelos de 17 años o más, excluye automáticamente bailarines y filas vacías, repara años de nacimiento (`0004` / edad), fusiona duplicados y genera el reporte descargable de casos descartados.
+                </p>
+              </div>
+
+              <label className="block border border-dashed border-white/25 hover:border-[#E2BA57]/60 bg-[#121216] rounded-sm p-5 text-center cursor-pointer transition-colors">
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  disabled={importingCsv}
+                  onChange={handleCsvFileSelect}
+                  className="hidden"
+                />
+                <Upload className="w-6 h-6 text-[#E2BA57] mx-auto mb-2" />
+                <p className="text-sm font-medium text-white">
+                  {csvFileName ? `Archivo cargado: ${csvFileName}` : 'Seleccionar archivo CSV de Google Forms'}
+                </p>
+                <p className="text-[11px] text-zinc-400 mt-1">
+                  Haz clic aquí para cargar y analizar el archivo antes de subir nada a Supabase
+                </p>
+              </label>
+
+              {csvImportResult && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                    <div className="bg-[#121216] border border-white/10 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-zinc-400 block">Filas CSV</span>
+                      <span className="text-lg font-bold text-white tabular-nums">
+                        {csvImportResult.summary.totalRows}
+                      </span>
+                    </div>
+                    <div className="bg-[#121216] border border-white/10 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-zinc-400 block">Bailarines omitidos</span>
+                      <span className="text-lg font-bold text-zinc-300 tabular-nums">
+                        {csvImportResult.summary.excludedDancers}
+                      </span>
+                    </div>
+                    <div className="bg-[#121216] border border-white/10 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-zinc-400 block">Duplicados fusionados</span>
+                      <span className="text-lg font-bold text-zinc-300 tabular-nums">
+                        {csvImportResult.summary.internalDuplicatesMerged + csvExistingDupCount}
+                      </span>
+                    </div>
+                    <div className="bg-[#121216] border border-amber-500/25 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-amber-300 block">Descartados / Menores</span>
+                      <span className="text-lg font-bold text-white tabular-nums">
+                        {csvImportResult.discardedRecords.length}
+                      </span>
+                    </div>
+                    <div className="bg-[#121216] border border-white/10 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-zinc-400 block">Fechas reparadas</span>
+                      <span className="text-lg font-bold text-emerald-300 tabular-nums">
+                        {csvImportResult.summary.repairedBirthYears}
+                      </span>
+                    </div>
+                    <div className="bg-[#121216] border border-emerald-500/30 p-3 rounded-sm">
+                      <span className="text-[10px] uppercase text-emerald-300 block">Listas para subir</span>
+                      <span className="text-lg font-bold text-white tabular-nums">
+                        {csvReadyToInsert.length}
+                      </span>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Incluye {csvImportResult.summary.withExtraMissingFields} modelos con algún dato pendiente además de fotos (correo/Instagram/estatura), marcadas con <code className="text-zinc-200">datos_incompletos = true</code> para contactarlas más adelante. Ya existentes en BD omitidas: <strong className="text-white tabular-nums">{csvExistingDupCount}</strong>.
+                  </p>
+
+                  {csvImportProgress && (
+                    <div className="space-y-1.5">
+                      <div className="flex justify-between text-xs text-zinc-300 tabular-nums">
+                        <span>{csvImportDone ? 'Importación completada' : 'Subiendo lote a Supabase...'}</span>
+                        <span>
+                          {csvImportProgress.inserted} / {csvImportProgress.total}
+                        </span>
+                      </div>
+                      <div className="w-full h-2 bg-white/10 rounded-sm overflow-hidden">
+                        <div
+                          className="h-full bg-emerald-500 transition-all duration-200"
+                          style={{
+                            width: `${Math.round(
+                              (csvImportProgress.inserted / Math.max(1, csvImportProgress.total)) * 100
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2 border-t border-white/10">
+                    {csvImportResult.discardedRecords.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleDownloadDiscardedCsv}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white/5 hover:bg-white/10 border border-white/15 rounded-sm text-xs font-medium text-amber-200 cursor-pointer transition-colors"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Descargar descartados ({csvImportResult.discardedRecords.length})</span>
+                      </button>
+                    )}
+
+                    <div className="flex items-center gap-2 ml-auto">
+                      <button
+                        type="button"
+                        disabled={importingCsv}
+                        onClick={() => setShowCsvImportModal(false)}
+                        className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm text-xs text-zinc-300 cursor-pointer disabled:opacity-40"
+                      >
+                        Cerrar
+                      </button>
+                      <button
+                        type="button"
+                        disabled={importingCsv || csvReadyToInsert.length === 0}
+                        onClick={handleConfirmCsvImport}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#CC0000] hover:bg-[#B30000] disabled:opacity-40 rounded-sm text-xs font-semibold text-white cursor-pointer transition-colors"
+                      >
+                        {importingCsv ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <CloudUpload className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          {importingCsv
+                            ? 'Importando...'
+                            : `Importar ${csvReadyToInsert.length} modelos a Supabase`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </motion.div>
           </motion.div>
         )}

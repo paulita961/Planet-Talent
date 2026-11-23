@@ -52,7 +52,7 @@
     <!-- Preconexión a Google Fonts para carga instantánea sin parpadeos -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Alex+Brush&family=Bebas+Neue&family=Caveat:wght@400..700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600;1,700&family=Great+Vibes&family=Instrument+Serif:ital@1&family=Inter:wght@300;400;500;600;700;800;900&family=Kaushan+Script&family=Parisienne&family=Pinyon+Script&family=Plus+Jakarta+Sans:wght@700;800&family=Poppins:wght@300;400&family=Shadows+Into+Light&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Alex+Brush&family=Bebas+Neue&family=Caveat:wght@400..700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600;1,700&family=Great+Vibes&family=Instrument+Serif:ital@1&family=Inter:wght@300;400;500;600;700;800;900&family=Kaushan+Script&family=Parisienne&family=Pinyon+Script&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Poppins:wght@300;400&family=Shadows+Into+Light&display=swap" rel="stylesheet" />
 
     <link rel="manifest" href="/manifest.json" />
     <title>Planet Talent | Agencia de Modelos</title>
@@ -62,17 +62,25 @@
     <script type="module" src="/src/main.tsx"></script>
     <script>
       if ('serviceWorker' in navigator) {
+        let refreshing = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (!refreshing) {
+            refreshing = true;
+            window.location.reload();
+          }
+        });
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js').then(registration => {
-            console.log('SW registered: ', registration);
-            // Auto update logic
+          navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).then(registration => {
+            registration.update().catch(() => {});
             registration.onupdatefound = () => {
               const installingWorker = registration.installing;
               if (installingWorker) {
                 installingWorker.onstatechange = () => {
                   if (installingWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                    // New update available, force reload
-                    window.location.reload();
+                    if (!refreshing) {
+                      refreshing = true;
+                      window.location.reload();
+                    }
                   }
                 };
               }

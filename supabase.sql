@@ -101,3 +101,88 @@ CREATE POLICY "Allow public delete from model-photos bucket" ON storage.objects
 -- ALTER TABLE models ADD COLUMN IF NOT EXISTS created_at timestamp with time zone default now();
 -- ALTER TABLE bookings ADD COLUMN IF NOT EXISTS telefono text;
 -- INSERT INTO storage.buckets (id, name, public) VALUES ('model-photos', 'model-photos', true) ON CONFLICT (id) DO NOTHING;
+
+-- 7. Create casting_applications table (17+ años)
+CREATE TABLE IF NOT EXISTS casting_applications (
+  id serial primary key,
+  nombre text not null,
+  apellidos text not null,
+  fecha_nacimiento date not null,
+  edad integer not null check (edad >= 17),
+  ciudad text not null,
+  whatsapp text not null,
+  correo text not null,
+  instagram text not null,
+  estatura integer not null,
+  busto integer,
+  cintura integer,
+  caderas integer,
+  talla_superior text not null,
+  talla_inferior text not null,
+  calzado text not null,
+  color_cabello text not null,
+  largo_cabello text not null,
+  color_ojos text not null,
+  tono_piel text not null,
+  tiene_piercings boolean default false,
+  tiene_tatuajes boolean default false,
+  detalle_piercings_tatuajes text,
+  foto_cara text,
+  foto_cuerpo text,
+  estado text default 'pendiente', -- 'pendiente', 'preseleccionada', 'seleccionada', 'descartada'
+  created_at timestamp with time zone default now()
+);
+
+-- Migración segura si casting_applications ya existía sin foto_cara / foto_cuerpo:
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS foto_cara text;
+ALTER TABLE casting_applications ADD COLUMN IF NOT EXISTS foto_cuerpo text;
+ALTER TABLE casting_applications ALTER COLUMN foto_cara DROP NOT NULL;
+ALTER TABLE casting_applications ALTER COLUMN foto_cuerpo DROP NOT NULL;
+NOTIFY pgrst, 'reload schema';
+
+-- 8. Row Level Security (RLS) for casting_applications:
+-- Cualquier visitante solo puede insertar (con edad >= 17); solo el administrador autenticado (Supabase Auth) puede leer, modificar o borrar.
+ALTER TABLE casting_applications ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Allow public insert to casting_applications" ON casting_applications;
+CREATE POLICY "Allow public insert to casting_applications" ON casting_applications
+  FOR INSERT TO anon, authenticated WITH CHECK (edad >= 17);
+
+DROP POLICY IF EXISTS "Allow authenticated admin read on casting_applications" ON casting_applications;
+CREATE POLICY "Allow authenticated admin read on casting_applications" ON casting_applications
+  FOR SELECT TO authenticated USING (true);
+
+DROP POLICY IF EXISTS "Allow authenticated admin update on casting_applications" ON casting_applications;
+CREATE POLICY "Allow authenticated admin update on casting_applications" ON casting_applications
+  FOR UPDATE TO authenticated USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow authenticated admin delete on casting_applications" ON casting_applications;
+CREATE POLICY "Allow authenticated admin delete on casting_applications" ON casting_applications
+  FOR DELETE TO authenticated USING (true);
+
+-- 9. Tabla global para controlar Activo / Pausado y fecha límite de cierre del casting
+CREATE TABLE IF NOT EXISTS casting_settings (
+  id integer primary key default 1,
+  enabled boolean not null default true,
+  deadline_iso timestamp with time zone not null default '2026-11-25T23:59:59-05:00',
+  updated_at timestamp with time zone default now()
+);
+
+INSERT INTO casting_settings (id, enabled, deadline_iso)
+VALUES (1, true, '2026-11-25T23:59:59-05:00')
+ON CONFLICT (id) DO UPDATE SET deadline_iso = EXCLUDED.deadline_iso;
+
+ALTER TABLE casting_settings ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Allow public read casting_settings" ON casting_settings;
+CREATE POLICY "Allow public read casting_settings" ON casting_settings
+  FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "Allow authenticated admin insert casting_settings" ON casting_settings;
+CREATE POLICY "Allow authenticated admin insert casting_settings" ON casting_settings
+  FOR INSERT TO authenticated WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow authenticated admin update casting_settings" ON casting_settings;
+CREATE POLICY "Allow authenticated admin update casting_settings" ON casting_settings
+  FOR UPDATE TO authenticated USING (true) WITH CHECK (true);
+

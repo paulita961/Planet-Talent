@@ -7,7 +7,7 @@ import {
   Instagram
 } from 'lucide-react';
 import { Model } from '../types';
-import { resolvePhoto, isModelFeatured } from '../App';
+import { resolvePhoto, resolveThumbnailPhoto, isModelFeatured } from '../App';
 
 interface FeaturedModelsCoverflowProps {
   models: Model[];
@@ -144,6 +144,26 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
     return () => clearInterval(timer);
   }, [isHovered, total, handleNext]);
 
+  // Preload adjacent cards (previous and next relative to active card) in background
+  useEffect(() => {
+    if (total <= 1) return;
+
+    const prevIdx = activeIndex === 0 ? total - 1 : activeIndex - 1;
+    const nextIdx = activeIndex === total - 1 ? 0 : activeIndex + 1;
+
+    [prevIdx, nextIdx].forEach((idx) => {
+      const adjacentModel = featuredModels[idx];
+      if (adjacentModel?.photos?.[0]) {
+        const thumbUrl = resolveThumbnailPhoto(adjacentModel.photos[0]);
+        if (thumbUrl) {
+          const img = new Image();
+          img.decoding = 'async';
+          img.src = thumbUrl;
+        }
+      }
+    });
+  }, [activeIndex, featuredModels, total]);
+
   // Keyboard navigation
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowLeft') {
@@ -203,7 +223,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
           <motion.div 
             initial={{ opacity: 0, y: 18 }}
             whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: "-40px" }}
+            viewport={{ once: true, amount: 0.05 }}
             transition={{ duration: 0.5, delay: 0.05, ease: [0.16, 1, 0.3, 1] }}
             className="flex items-center gap-2 mb-2 sm:mb-2.5"
           >
@@ -217,7 +237,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
           <motion.h2 
             initial={{ opacity: 0, y: 22 }}
             whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: "-40px" }}
+            viewport={{ once: true, amount: 0.05 }}
             transition={{ duration: 0.6, delay: 0.15, ease: [0.16, 1, 0.3, 1] }}
             className="flex items-baseline gap-2 sm:gap-3.5 select-none"
           >
@@ -236,7 +256,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
         ref={containerRef}
         initial={{ opacity: 0, y: 30, scale: 0.97 }}
         whileInView={{ opacity: 1, y: 0, scale: 1 }}
-        viewport={{ once: true, margin: "-40px" }}
+        viewport={{ once: true, amount: 0.05 }}
         transition={{ duration: 0.75, delay: 0.4, ease: [0.16, 1, 0.3, 1] }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
@@ -279,8 +299,10 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
 
             const isCenter = offset === 0;
             const isImmediate = Math.abs(offset) === 1;
+            const isVisible = Math.abs(offset) <= 2;
 
-            const firstPhoto = model.photos && model.photos[0] ? resolvePhoto(model.photos[0]) : null;
+            // Use lightweight thumbnail (600px WebP) rather than full 1200x1600
+            const firstPhoto = model.photos && model.photos[0] ? resolveThumbnailPhoto(model.photos[0]) : null;
 
             // Compute synchronized 3D translations, scale, rotation and opacity
             let translateX = 0;
@@ -359,10 +381,12 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
                     ? (lang === 'es' ? `Ver ficha completa de ${fullName}` : `View full portfolio of ${fullName}`)
                     : (lang === 'es' ? `Centrar a ${fullName}` : `Center ${fullName}`)
                 }
-                className={`group absolute w-[250px] xs:w-[280px] sm:w-[320px] md:w-[350px] h-[360px] xs:h-[400px] sm:h-[460px] md:h-[500px] rounded-2xl overflow-hidden cursor-pointer transition-all duration-500 will-change-transform ${
+                className={`group absolute w-[250px] xs:w-[280px] sm:w-[320px] md:w-[350px] h-[360px] xs:h-[400px] sm:h-[460px] md:h-[500px] rounded-2xl overflow-hidden cursor-pointer ${
+                  isVisible ? 'will-change-transform' : ''
+                } ${
                   isCenter 
                     ? 'shadow-[0_25px_60px_-15px_rgba(0,0,0,0.95),0_0_35px_rgba(204,0,0,0.28)] border border-white/25 hover:border-white/45' 
-                    : 'shadow-2xl border border-white/10 hover:border-white/25 hover:opacity-80'
+                    : 'shadow-2xl border border-white/10 hover:border-white/25'
                 }`}
                 style={{
                   transformStyle: 'preserve-3d',
@@ -377,15 +401,20 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
                       src={firstPhoto}
                       alt={fullName}
                       referrerPolicy="no-referrer"
-                      loading={Math.abs(offset) <= 1 ? "eager" : "lazy"}
+                      loading={isImmediate || isCenter ? "eager" : "lazy"}
                       decoding="async"
-                      className={`w-full h-full object-cover origin-center transition-all duration-700 ease-out ${
-                        isCenter 
-                          ? 'scale-100 group-hover:scale-105 contrast-[1.08] saturate-[1.1] grayscale-0 brightness-100' 
-                          : 'scale-105 grayscale contrast-[0.95] brightness-[0.6]'
+                      className={`w-full h-full object-cover origin-center ${
+                        isCenter ? 'scale-100 group-hover:scale-105 transition-transform duration-500 ease-out' : 'scale-105'
                       }`}
                       onError={(e) => {
-                        e.currentTarget.style.display = 'none';
+                        const img = e.currentTarget;
+                        const fallbackUrl = model.photos?.[0] ? resolvePhoto(model.photos[0]) : undefined;
+                        if (fallbackUrl && img.dataset.fallbackTried !== '1' && img.src !== fallbackUrl) {
+                          img.dataset.fallbackTried = '1';
+                          img.src = fallbackUrl;
+                        } else {
+                          img.style.display = 'none';
+                        }
                       }}
                     />
                   ) : (
@@ -407,16 +436,16 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
                     rel="noopener noreferrer"
                     onClick={(e) => e.stopPropagation()}
                     title={`Abrir perfil de Instagram: ${instaInfo.handle}`}
-                    className={`absolute top-3.5 right-3.5 sm:top-4 sm:right-4 z-30 inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-[10px] sm:text-xs font-mono tracking-tight backdrop-blur-md border transition-all duration-300 hover:scale-105 active:scale-95 group/insta cursor-pointer ${
+                    className={`absolute top-3.5 right-3.5 sm:top-4 sm:right-4 z-30 inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-[10px] sm:text-xs font-mono tracking-tight backdrop-blur-md border transition-transform duration-200 hover:scale-105 active:scale-95 group/insta cursor-pointer ${
                       isCenter
                         ? 'bg-black/75 hover:bg-black/90 border-white/20 hover:border-white/40 text-white shadow-lg'
                         : 'bg-black/50 border-white/10 text-neutral-400 opacity-70 hover:opacity-100'
                     }`}
                   >
-                    <Instagram className={`w-3 h-3 sm:w-3.5 sm:h-3.5 shrink-0 transition-colors ${
+                    <Instagram className={`w-3 h-3 sm:w-3.5 sm:h-3.5 shrink-0 ${
                       isCenter ? 'text-[#8A8A8A] group-hover/insta:text-white' : 'text-neutral-400'
                     }`} />
-                    <span className={`transition-colors underline underline-offset-2 decoration-white/30 group-hover/insta:decoration-white ${
+                    <span className={`underline underline-offset-2 decoration-white/30 group-hover/insta:decoration-white ${
                       isCenter ? 'text-[#F8F6F2] group-hover/insta:text-white' : 'text-neutral-300'
                     }`}>
                       {instaInfo.handle}
@@ -426,7 +455,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
 
                 {/* Bottom Model Name Container */}
                 <div className="absolute bottom-0 left-0 right-0 p-4 sm:p-6 z-10 flex flex-col justify-end">
-                  <h3 className="flex flex-col items-start drop-shadow-[0_2px_12px_rgba(0,0,0,0.95)] transition-all duration-500">
+                  <h3 className="flex flex-col items-start drop-shadow-[0_2px_12px_rgba(0,0,0,0.95)]">
                     {/* Línea 1: Nombre(s) en tipografía brush bold */}
                     <span className={`font-brush font-bold text-white tracking-wide leading-tight drop-shadow-md block ${
                       isLongName 
@@ -436,7 +465,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
                       {model.nombre}
                     </span>
                     {/* Línea 2: Apellidos en tipografía condensada en color blanco */}
-                    <span className={`font-condensed tracking-wider uppercase leading-none transition-colors duration-700 block -mt-0.5 sm:-mt-1 ${
+                    <span className={`font-condensed tracking-wider uppercase leading-none transition-colors duration-300 block -mt-0.5 sm:-mt-1 ${
                       isLongName 
                         ? 'text-xl sm:text-2xl md:text-[30px]' 
                         : 'text-2xl sm:text-3xl md:text-[36px]'
@@ -447,7 +476,7 @@ export const FeaturedModelsCoverflow: React.FC<FeaturedModelsCoverflowProps> = (
                     </span>
                   </h3>
 
-                  {/* Followers Count Badge (sin icono de seguidores) */}
+                  {/* Followers Count Badge */}
                   {instaInfo?.followers && (
                     <div className="mt-1.5 sm:mt-2 flex items-center">
                       <div className={`inline-flex items-center text-[10px] sm:text-xs font-mono backdrop-blur-md px-2.5 sm:px-3 py-0.5 rounded-full border shadow-sm ${

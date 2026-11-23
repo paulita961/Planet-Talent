@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Alex+Brush&family=Bebas+Neue&family=Caveat:wght@400..700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600;1,700&family=Great+Vibes&family=Instrument+Serif:ital@1&family=Inter:wght@300;400;500;600;700;800;900&family=Kaushan+Script&family=Parisienne&family=Pinyon+Script&family=Plus+Jakarta+Sans:wght@700;800&family=Poppins:wght@300;400&family=Shadows+Into+Light&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Alex+Brush&family=Bebas+Neue&family=Caveat:wght@400..700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600;1,700&family=Great+Vibes&family=Instrument+Serif:ital@1&family=Inter:wght@300;400;500;600;700;800;900&family=Kaushan+Script&family=Parisienne&family=Pinyon+Script&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Poppins:wght@300;400&family=Shadows+Into+Light&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -42,6 +42,48 @@
 
 .animate-gentle-pulse {
   animation: gentle-pulse 2s infinite ease-in-out;
+}
+
+@keyframes cta-invite-float {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-2px) scale(1.022);
+  }
+}
+
+@keyframes cta-sheen-sweep {
+  0%, 62% {
+    transform: translateX(-160%) skewX(-22deg);
+    opacity: 0;
+  }
+  72% {
+    opacity: 0.55;
+  }
+  92%, 100% {
+    transform: translateX(260%) skewX(-22deg);
+    opacity: 0;
+  }
+}
+
+.cta-invite-btn {
+  animation: cta-invite-float 2.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.cta-invite-btn:hover {
+  animation: none;
+}
+
+.cta-sheen-layer {
+  animation: cta-sheen-sweep 3.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cta-invite-btn,
+  .cta-sheen-layer {
+    animation: none !important;
+  }
 }
 
 /* Custom Toast styling (Sonner override) */

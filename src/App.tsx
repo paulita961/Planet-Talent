@@ -47,10 +47,17 @@ import { supabase, getCachedModels, getCachedBookings, invalidateModelsCache, in
 import { Model } from './types';
 import { ManagerDashboard } from './components/ManagerDashboard';
 import { TouchLightbox } from './components/TouchLightbox';
-import { CourseLanding } from './components/CourseLanding';
 import { FeaturedModelsCoverflow } from './components/FeaturedModelsCoverflow';
+import { CastingPage } from './components/CastingPage';
 import { Toaster, toast } from 'sonner';
 import { getOptimizedPhotoUrl } from './lib/imageOptimizer';
+import {
+  CASTING_EVENT_UPDATED,
+  CASTING_ONLY_PREVIEW_MODE,
+  CASTING_STORAGE_KEY,
+  fetchRemoteCastingConfig,
+  isCastingActive,
+} from './lib/castingConfig';
 
 // FOTOS EN BASE64 PROPORCIONADAS
 export const PHOTO_DATA: Record<string, string> = {
@@ -61,13 +68,17 @@ export const PHOTO_DATA: Record<string, string> = {
   "cristal_bw_pool": "https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=800&q=80"
 };
 
-export const resolvePhoto = (photoVal: string | undefined | null): string | undefined => {
+export const resolvePhoto = (photoVal: string | undefined | null, type: 'full' | 'thumb' = 'full'): string | undefined => {
   if (!photoVal) return undefined;
   if (photoVal.startsWith('data:') || photoVal.startsWith('http') || photoVal.startsWith('/')) {
-    return getOptimizedPhotoUrl(photoVal);
+    return getOptimizedPhotoUrl(photoVal, type);
   }
   const mapped = PHOTO_DATA[photoVal];
-  return mapped ? getOptimizedPhotoUrl(mapped) : undefined;
+  return mapped ? getOptimizedPhotoUrl(mapped, type) : undefined;
+};
+
+export const resolveThumbnailPhoto = (photoVal: string | undefined | null): string | undefined => {
+  return resolvePhoto(photoVal, 'thumb');
 };
 
 export const formatUpdatedAgo = (dateStr: string | undefined | null, lang: 'es' | 'en'): string => {
@@ -1139,18 +1150,55 @@ export default function App() {
     localStorage.setItem('pt_lang', l);
   };
 
-  const [session, setSession] = useState<any>(null);
+  const [session, setSession] = useState<any>(() => {
+    try {
+      const storedSession = localStorage.getItem('adminSession');
+      return storedSession ? JSON.parse(storedSession) : null;
+    } catch (e) {
+      console.warn("Error parsing adminSession:", e);
+      localStorage.removeItem('adminSession');
+      return null;
+    }
+  });
 
   useEffect(() => {
-    const storedSession = localStorage.getItem('adminSession');
-    if (storedSession) {
-      try {
-        setSession(JSON.parse(storedSession));
-      } catch (e) {
-        console.warn("Error parsing adminSession:", e);
+    let active = true;
+
+    supabase.auth.getSession()
+      .then(({ data: { session: authSession } }) => {
+        if (!active) return;
+        if (authSession?.user) {
+          const nextSession = {
+            email: authSession.user.email || '',
+            supabaseAuth: true,
+            userId: authSession.user.id,
+          };
+          setSession(nextSession);
+          localStorage.setItem('adminSession', JSON.stringify(nextSession));
+        }
+      })
+      .catch(() => {});
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, authSession) => {
+      if (!active) return;
+      if (event === 'SIGNED_OUT') {
+        setSession(null);
         localStorage.removeItem('adminSession');
+      } else if (authSession?.user && (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED')) {
+        const nextSession = {
+          email: authSession.user.email || '',
+          supabaseAuth: true,
+          userId: authSession.user.id,
+        };
+        setSession(nextSession);
+        localStorage.setItem('adminSession', JSON.stringify(nextSession));
       }
-    }
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
   const [dbModels, setDbModels] = useState<Model[]>([]);
@@ -1269,6 +1317,133 @@ export default function App() {
   // Advanced Filters & Guide State
   const [showAdvancedFilters, setShowAdvancedFilters] = useState<boolean>(false);
   const [showLevelGuideModal, setShowLevelGuideModal] = useState<boolean>(false);
+  const isCastingUrl = () => {
+    if (CASTING_ONLY_PREVIEW_MODE) return true;
+    if (typeof window === 'undefined') return false;
+    return (
+      window.location.hash.toLowerCase() === '#casting' ||
+      window.location.pathname.replace(/\/+$/, '') === '/casting'
+    );
+  };
+
+  const isAdminUrl = () => {
+    if (typeof window === 'undefined') return false;
+    const normalizedPath = window.location.pathname.replace(/\/+$/, '').toLowerCase();
+    return (
+      window.location.hash.toLowerCase() === '#admin' ||
+      normalizedPath === '/admin'
+    );
+  };
+
+  const [currentView, setCurrentView] = useState<'catalog' | 'casting'>(() =>
+    isCastingUrl() ? 'casting' : 'catalog'
+  );
+  const [castingActive, setCastingActive] = useState<boolean>(() => isCastingActive());
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const manifestLink = document.querySelector('link[rel="manifest"]');
+    const metaDesc = document.querySelector('meta[name="description"]');
+    if (currentView === 'casting') {
+      document.title = 'Casting Planet Talent | Convocatoria para Modelos';
+      if (manifestLink) manifestLink.setAttribute('href', '/manifest-casting.json');
+      if (metaDesc) {
+        metaDesc.setAttribute(
+          'content',
+          'Convocatoria presencial de casting para modelos · 28 y 29 de noviembre en Estudio 50 (Calle Lugareño esq. Almendares, Vedado, Plaza de la Revolución), La Habana.'
+        );
+      }
+    } else {
+      document.title = 'Planet Talent | Agencia de Modelos';
+      if (manifestLink) manifestLink.setAttribute('href', '/manifest.json');
+      if (metaDesc) {
+        metaDesc.setAttribute(
+          'content',
+          'Planet Talent — Agencia de Modelos. Catálogo profesional con fichas técnicas, medidas, portafolios fotográficos y reserva de casting en línea.'
+        );
+      }
+    }
+  }, [currentView]);
+
+  const openCastingPage = () => {
+    setCurrentView('casting');
+    if (typeof window !== 'undefined') {
+      if (window.location.hash.toLowerCase() !== '#casting') {
+        window.location.hash = 'casting';
+      }
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  };
+
+  const backToCatalog = () => {
+    if (CASTING_ONLY_PREVIEW_MODE) return;
+    setCurrentView('catalog');
+    if (typeof window !== 'undefined') {
+      const targetPath = window.location.pathname.replace(/\/+$/, '') === '/casting'
+        ? '/'
+        : window.location.pathname + window.location.search;
+      window.history.pushState({ view: 'catalog' }, '', targetPath);
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  };
+
+  useEffect(() => {
+    const syncRoute = () => {
+      setCurrentView(isCastingUrl() ? 'casting' : 'catalog');
+    };
+    const syncAdminRoute = () => {
+      if (isAdminUrl()) {
+        window.history.replaceState({}, '', '/');
+        setShowManagerLogin(true);
+      }
+    };
+    syncRoute();
+    syncAdminRoute();
+    const handleHashChange = () => {
+      syncRoute();
+      syncAdminRoute();
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    window.addEventListener('popstate', syncRoute);
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+      window.removeEventListener('popstate', syncRoute);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncCastingState = () => {
+      setCastingActive(isCastingActive());
+    };
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === CASTING_STORAGE_KEY || e.key === null) {
+        syncCastingState();
+      }
+    };
+
+    fetchRemoteCastingConfig().then(syncCastingState);
+
+    const settingsChannel = supabase
+      .channel('public:casting_settings_sync')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'casting_settings' },
+        () => {
+          fetchRemoteCastingConfig().then(syncCastingState);
+        }
+      )
+      .subscribe();
+
+    window.addEventListener(CASTING_EVENT_UPDATED, syncCastingState);
+    window.addEventListener('storage', handleStorage);
+    const interval = window.setInterval(syncCastingState, 60000);
+    return () => {
+      window.removeEventListener(CASTING_EVENT_UPDATED, syncCastingState);
+      window.removeEventListener('storage', handleStorage);
+      window.clearInterval(interval);
+      supabase.removeChannel(settingsChannel);
+    };
+  }, []);
   const [selectedSkins, setSelectedSkins] = useState<string[]>([]);
   const [selectedEyes, setSelectedEyes] = useState<string[]>([]);
   const [selectedShoes, setSelectedShoes] = useState<string[]>([]);
@@ -1367,9 +1542,6 @@ export default function App() {
   const [bookingLoading, setBookingLoading] = useState<boolean>(false);
   const [bookingError, setBookingError] = useState<string>('');
   
-  // Main View Navigation State ('catalog' or 'course')
-  const [currentView, setCurrentView] = useState<'catalog' | 'course'>('catalog');
-
   // Lightbox State
   const [showLightbox, setShowLightbox] = useState<boolean>(false);
 
@@ -1516,29 +1688,65 @@ export default function App() {
     setTouchEnd(null);
   }
 
+  const closeManagerLogin = () => {
+    setShowManagerLogin(false);
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginLoading(true);
     setLoginError('');
 
+    const cleanEmail = managerEmail.trim();
+
     try {
+      // Vía B: Autenticación oficial mediante Supabase Auth (permite RLS TO authenticated)
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+        email: cleanEmail,
+        password: managerPassword,
+      });
+
+      if (!authError && authData?.user) {
+        const newSession = {
+          email: authData.user.email || cleanEmail,
+          supabaseAuth: true,
+          userId: authData.user.id,
+        };
+        setSession(newSession);
+        localStorage.setItem('adminSession', JSON.stringify(newSession));
+        setShowManagerLogin(false);
+        setManagerEmail('');
+        setManagerPassword('');
+        if (typeof window !== 'undefined' && isAdminUrl()) {
+          window.history.replaceState({}, '', '/');
+        }
+        return;
+      }
+
+      // Respaldo compatible con tabla admin_users (si aún no se creó el usuario en Authentication → Users)
       const { data, error } = await supabase
         .from('admin_users')
         .select('*')
-        .eq('email', managerEmail)
+        .eq('email', cleanEmail)
         .eq('password', managerPassword)
         .single();
 
       if (error || !data) {
         throw new Error('Credenciales inválidas');
       }
-      
-      const newSession = { email: data.email };
-      setSession(newSession);
-      localStorage.setItem('adminSession', JSON.stringify(newSession));
+
+      const fallbackSession = { email: data.email, supabaseAuth: false };
+      setSession(fallbackSession);
+      localStorage.setItem('adminSession', JSON.stringify(fallbackSession));
       setShowManagerLogin(false);
       setManagerEmail('');
       setManagerPassword('');
+      if (typeof window !== 'undefined' && isAdminUrl()) {
+        window.history.replaceState({}, '', '/');
+      }
+      toast.warning(
+        'Acceso sin Supabase Auth: crea el usuario en Supabase Authentication → Users para leer/editar postulantes del Casting (RLS).'
+      );
     } catch (error: any) {
       setLoginError(error.message || 'Credenciales inválidas');
     } finally {
@@ -1547,9 +1755,17 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      // ignore signOut errors
+    }
     invalidateModelsCache();
     setSession(null);
     localStorage.removeItem('adminSession');
+    if (typeof window !== 'undefined' && isAdminUrl()) {
+      window.history.replaceState({}, '', '/');
+    }
   };
 
   // Active Photo in Modal Showcase
@@ -2733,7 +2949,7 @@ export default function App() {
           console.error("Fetch to Telegram failed:", err);
         });
 
-        // Still call the backend to send WhatsApp if needed
+        // Call backend backup notification endpoint (Telegram)
         await fetch('/api/notify-booking', {
           method: 'POST',
           headers: {
@@ -2783,8 +2999,116 @@ export default function App() {
     setActivePhotoIdx(0);
   };
 
+  const managerLoginModal = (
+    <AnimatePresence>
+      {showManagerLogin && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4 bg-black/95 backdrop-blur-xl"
+        >
+          {/* Logo encima del modal sin fondo blanco */}
+          <div className="mb-6 sm:mb-8 flex flex-col items-center">
+            <img 
+              src="/Logo de Planet Talent.PNG" 
+              alt="Planet Talent" 
+              className="h-10 sm:h-12 md:h-14 w-auto object-contain block drop-shadow-xl" 
+            />
+          </div>
+
+          <motion.div
+            initial={{ scale: 0.95, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.95, opacity: 0 }}
+            className="bg-[#0A0A0A] border border-white/10 p-8 rounded-sm w-full max-w-md relative"
+          >
+            <button
+              type="button"
+              onClick={closeManagerLogin}
+              className="absolute top-6 right-6 text-[#8A8A8A] hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="mb-8 text-center mt-2">
+              <h3 className="font-sans text-xl tracking-wide font-medium text-white mb-2 uppercase">{TRANSLATIONS[lang].managerAccess}</h3>
+              <p className="text-xs text-gray-400">{TRANSLATIONS[lang].cmsSubtitle}</p>
+            </div>
+
+            <form onSubmit={handleLogin} className="flex flex-col gap-5">
+              <div className="flex flex-col gap-2 relative">
+                <label className="text-[10px] tracking-widest uppercase text-gray-200 font-bold">{TRANSLATIONS[lang].email}</label>
+                <input
+                  type="email"
+                  required
+                  autoComplete="username"
+                  value={managerEmail}
+                  onChange={(e) => setManagerEmail(e.target.value)}
+                  className="w-full bg-white border border-gray-300 px-4 py-3 text-sm text-black placeholder:text-gray-400 rounded-sm focus:outline-none focus:border-[#CC0000] transition-colors"
+                  placeholder={TRANSLATIONS[lang].emailPlaceholder}
+                />
+              </div>
+
+              <div className="flex flex-col gap-2 relative">
+                <label className="text-[10px] tracking-widest uppercase text-gray-200 font-bold">{TRANSLATIONS[lang].password}</label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  value={managerPassword}
+                  onChange={(e) => setManagerPassword(e.target.value)}
+                  className="w-full bg-white border border-gray-300 px-4 py-3 text-sm text-black placeholder:text-gray-400 rounded-sm focus:outline-none focus:border-[#CC0000] transition-colors"
+                  placeholder={TRANSLATIONS[lang].passwordPlaceholder}
+                />
+              </div>
+
+              {loginError && (
+                <p className="text-[#CC0000] text-[10px] tracking-wider mt-1 text-center font-bold max-w-xs mx-auto leading-tight">{loginError}</p>
+              )}
+
+              <button
+                type="submit"
+                disabled={loginLoading}
+                className="w-full py-4 bg-[#CC0000] hover:bg-[#CC0000]/90 disabled:opacity-50 text-white rounded-sm text-xs uppercase tracking-wider font-bold transition-all mt-4"
+              >
+                {loginLoading ? '...' : TRANSLATIONS[lang].enterPanel}
+              </button>
+            </form>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+
   if (session) {
     return <ManagerDashboard onLogout={handleLogout} />;
+  }
+
+  if (currentView === 'casting') {
+    return (
+      <>
+        <Toaster
+          theme="dark"
+          position="bottom-center"
+          toastOptions={{
+            style: {
+              background: '#0A0A0A',
+              color: '#FFFFFF',
+              border: '1px solid rgba(204, 0, 0, 0.4)',
+              borderRadius: '4px',
+            },
+          }}
+        />
+        <CastingPage
+          lang={lang}
+          onChangeLang={changeLang}
+          onBackToCatalog={backToCatalog}
+          castingActive={castingActive}
+        />
+        {managerLoginModal}
+      </>
+    );
   }
 
   return (
@@ -2803,87 +3127,87 @@ export default function App() {
         }} 
       />
       {/* NAVEGACIÓN DEL CATÁLOGO DE MODELOS */}
-      {currentView === 'catalog' && (
-        <motion.nav 
-          id="nav-bar" 
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-          style={{
-            backgroundColor: navBg,
-            backdropFilter: navBackdropBlur,
-            WebkitBackdropFilter: navBackdropBlur,
-            paddingTop: navPaddingY,
-            paddingBottom: navPaddingY,
-            borderBottomColor: navBorderColor
-          }}
-          className="fixed top-0 left-0 right-0 z-40 flex items-center justify-between gap-4 px-4 sm:px-6 md:px-12 border-b shadow-[0_10px_40px_rgba(0,0,0,0.5)] transition-[box-shadow]"
-        >
-          <motion.button 
-            id="logo" 
-            style={{ scale: logoScale, originX: 0, originY: 0.5 }}
-            onClick={(e) => {
-              e.preventDefault();
-              setShowManagerLogin(true);
-              setLoginError("");
-            }}
-            title={lang === "es" ? "Acceso a la gestión de la agencia" : "Agency management login"}
-            className="flex items-center group appearance-none text-left cursor-pointer shrink-0 will-change-transform"
-          >
-            <img 
-              src="/Logo de Planet Talent.PNG" 
-              alt="Planet Talent" 
-              className="h-7 sm:h-8 md:h-9 w-auto object-contain origin-left group-hover:opacity-80 transition-opacity duration-300 ease-out drop-shadow-md" 
-            />
-          </motion.button>
-          
-          <div className="flex items-center gap-3 sm:gap-6 shrink-0">
-            {/* Selector de Idioma Sutil y Minimalista */}
-            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full transition-all backdrop-blur-md select-none text-[10px] sm:text-xs">
-              <Globe className="w-3 h-3 text-white/50 shrink-0" />
-              <button
-                onClick={() => changeLang("es")}
-                title={lang === "es" ? "Idioma Español seleccionado" : "Cambiar a Español"}
-                className={`transition-colors uppercase font-medium tracking-wider cursor-pointer px-0.5 ${
-                  lang === "es" 
-                    ? "text-white font-semibold" 
-                    : "text-white/40 hover:text-white/80"
-                }`}
-              >
-                ES
-              </button>
-              <span className="text-white/20 text-[9px] font-light">|</span>
-              <button
-                onClick={() => changeLang("en")}
-                title={lang === "es" ? "Cambiar a Inglés" : "English language selected"}
-                className={`transition-colors uppercase font-medium tracking-wider cursor-pointer px-0.5 ${
-                  lang === "en" 
-                    ? "text-white font-semibold" 
-                    : "text-white/40 hover:text-white/80"
-                }`}
-              >
-                EN
-              </button>
-            </div>
-
-            <span id="nav-label" className="text-[10px] md:text-xs tracking-[0.25em] uppercase text-[#8A8A8A] font-medium border-l border-white/10 pl-4 md:pl-6 hidden md:inline-block">
-              {TRANSLATIONS[lang].agency}
-            </span>
-          </div>
-        </motion.nav>
-      )}
-
-      {currentView === 'course' ? (
-        <CourseLanding 
-          lang={lang} 
-          onGoToCatalog={() => setCurrentView('catalog')} 
-          onGoToAdminLogin={() => {
+      <motion.nav 
+        id="nav-bar" 
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+        style={{
+          backgroundColor: navBg,
+          backdropFilter: navBackdropBlur,
+          WebkitBackdropFilter: navBackdropBlur,
+          paddingTop: navPaddingY,
+          paddingBottom: navPaddingY,
+          borderBottomColor: navBorderColor
+        }}
+        className="fixed top-0 left-0 right-0 z-40 flex items-center justify-between gap-4 px-4 sm:px-6 md:px-12 border-b shadow-[0_10px_40px_rgba(0,0,0,0.5)] transition-[box-shadow]"
+      >
+        <motion.button 
+          id="logo" 
+          style={{ scale: logoScale, originX: 0, originY: 0.5 }}
+          onClick={(e) => {
+            e.preventDefault();
             setShowManagerLogin(true);
-            setLoginError('');
-          }} 
-        />
-      ) : (
-        <>
+            setLoginError("");
+          }}
+          title={lang === "es" ? "Acceso a la gestión de la agencia" : "Agency management login"}
+          className="flex items-center group appearance-none text-left cursor-pointer shrink-0 will-change-transform"
+        >
+          <img 
+            src="/Logo de Planet Talent.PNG" 
+            alt="Planet Talent" 
+            className="h-7 sm:h-8 md:h-9 w-auto object-contain origin-left group-hover:opacity-80 transition-opacity duration-300 ease-out drop-shadow-md" 
+          />
+        </motion.button>
+        
+        <div className="flex items-center gap-2.5 sm:gap-5 shrink-0">
+          {castingActive && (
+            <button
+              id="nav-casting-btn"
+              type="button"
+              onClick={openCastingPage}
+              className="px-2.5 py-1 text-white/95 hover:text-white border-b border-[#E2BA57]/70 hover:border-[#CC0000] text-xs sm:text-[13px] font-semibold uppercase tracking-[0.05em] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <span className="sm:hidden">{lang === 'es' ? 'Casting' : 'Casting'}</span>
+              <span className="hidden sm:inline">
+                {lang === 'es' ? 'Casting · 28–29 Nov' : 'Casting · Nov 28–29'}
+              </span>
+            </button>
+          )}
+
+          {/* Selector de Idioma Sutil y Minimalista */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full transition-all backdrop-blur-md select-none text-[10px] sm:text-xs">
+            <Globe className="w-3 h-3 text-white/50 shrink-0" />
+            <button
+              onClick={() => changeLang("es")}
+              title={lang === "es" ? "Idioma Español seleccionado" : "Cambiar a Español"}
+              className={`transition-colors uppercase font-medium tracking-wider cursor-pointer px-0.5 ${
+                lang === "es" 
+                  ? "text-white font-semibold" 
+                  : "text-white/40 hover:text-white/80"
+              }`}
+            >
+              ES
+            </button>
+            <span className="text-white/20 text-[9px] font-light">|</span>
+            <button
+              onClick={() => changeLang("en")}
+              title={lang === "es" ? "Cambiar a Inglés" : "English language selected"}
+              className={`transition-colors uppercase font-medium tracking-wider cursor-pointer px-0.5 ${
+                lang === "en" 
+                  ? "text-white font-semibold" 
+                  : "text-white/40 hover:text-white/80"
+              }`}
+            >
+              EN
+            </button>
+          </div>
+
+          <span id="nav-label" className="text-[10px] md:text-xs tracking-[0.25em] uppercase text-[#8A8A8A] font-medium border-l border-white/10 pl-4 md:pl-6 hidden md:inline-block whitespace-nowrap shrink-0">
+            {TRANSLATIONS[lang].agency}
+          </span>
+        </div>
+      </motion.nav>
           {/* HERO SECTION */}
       <section 
         id="hero-section" 
@@ -2991,6 +3315,33 @@ export default function App() {
             <ChevronDown className="w-3.5 h-3.5 text-white/50 group-hover:text-white transition-transform duration-300 group-hover:translate-y-0.5" />
           </motion.button>
         </motion.div>
+
+        {/* Invitación discreta y sugerente anclada al pie del Hero sin interrumpir el centro visual */}
+        {castingActive && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.9, delay: 1.25, ease: [0.16, 1, 0.3, 1] }}
+            className="absolute bottom-5 sm:bottom-8 inset-x-0 z-20 flex justify-center px-4 pointer-events-none"
+          >
+            <button
+              id="hero-casting-notice"
+              type="button"
+              onClick={openCastingPage}
+              className="pointer-events-auto group inline-flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 py-2 px-4 bg-black/65 hover:bg-black/80 backdrop-blur-md border border-white/15 hover:border-[#E2BA57]/45 rounded-sm text-[13px] sm:text-[15px] font-sans tracking-normal text-white/90 hover:text-white transition-all cursor-pointer shadow-lg"
+            >
+              <span className="italic text-white/85 group-hover:text-white transition-colors">
+                {lang === 'es'
+                  ? '¿Te imaginas en el próximo videoclip?'
+                  : 'Picture yourself in our next music video?'}
+              </span>
+              <span className="text-[#CC0000] font-bold" aria-hidden="true">·</span>
+              <span className="uppercase tracking-[0.04em] text-[13px] sm:text-[14px] font-semibold text-[#FCE99F] underline underline-offset-4 decoration-[#CC0000] group-hover:text-white">
+                {lang === 'es' ? 'Casting 28–29 Nov' : 'Casting Nov 28–29'}
+              </span>
+            </button>
+          </motion.div>
+        )}
       </section>
 
       {/* SECCIÓN MODELOS DESTACADAS (COVERFLOW CAROUSEL) */}
@@ -4362,146 +4713,97 @@ export default function App() {
             }
           }
         }}
-        className="border-t border-white/5 py-3.5 sm:py-5 md:py-8 px-4 sm:px-6 md:px-12 flex flex-col items-center justify-between gap-2 md:flex-row md:gap-6"
+        className="border-t border-white/5 py-5 sm:py-6 md:py-8 px-4 sm:px-6 md:px-12 flex flex-col gap-5"
       >
-        <motion.div 
-          variants={{
-            hidden: { opacity: 0, y: 20 },
-            visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
-          }}
-          onClick={() => {
-            setShowManagerLogin(true);
-            setLoginError('');
-          }}
-          className="font-sans text-[10px] md:text-xs tracking-[0.2em] uppercase text-[#8A8A8A] font-medium flex-1 text-center md:text-left cursor-pointer hover:text-white transition-colors py-0.5 flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 justify-center md:justify-start"
+        {/* Sello permanente de respaldo y partners */}
+        <div
+          id="partners-trust-seal"
+          className="border-b border-white/5 pb-4 text-center"
         >
-          <span>PLANET<span className="text-[#CC0000]">TALENT</span> · {TRANSLATIONS[lang].agency}</span>
-          <span className="hidden sm:inline text-white/20">|</span>
-          <span className="text-white/40 text-[9px] sm:text-[10px] tracking-wider font-normal">
-            {lang === 'es' ? 'Agencia de Modelos #1 de Cuba' : "Cuba's #1 Model Agency"}
-          </span>
-        </motion.div>
-        
-        {/* REDES SOCIALES */}
-        <motion.div 
-          variants={{
-            hidden: { opacity: 0, y: 20 },
-            visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
-          }}
-          className="flex items-center justify-center gap-3 sm:gap-5"
-        >
-          <a 
-            href="mailto:talent@planetrecords.it" 
-            className="p-1 text-[#8A8A8A] hover:text-white hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.7)] transition-all duration-300 ease-out transform hover:scale-125 active:scale-95 inline-flex items-center justify-center cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-black" 
-            aria-label={lang === 'es' ? 'Contactar por correo electrónico a Planet Talent' : 'Contact Planet Talent via email'}
-            title={lang === 'es' ? 'Contactar por email (talent@planetrecords.it)' : 'Contact via email (talent@planetrecords.it)'}
-          >
-            <Mail className="w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-300 ease-out" aria-hidden="true" />
-          </a>
-          <a 
-            href="https://www.instagram.com/planet_talent_agency?igsh=MTUzZzhwZzV5Yng0ZA==" 
-            target="_blank" 
-            rel="noopener noreferrer" 
-            className="p-1 text-[#8A8A8A] hover:text-white hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.7)] transition-all duration-300 ease-out transform hover:scale-125 active:scale-95 inline-flex items-center justify-center cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-black" 
-            aria-label={lang === 'es' ? 'Visitar perfil oficial de Instagram de Planet Talent Agency' : 'Visit Planet Talent Agency official Instagram profile'}
-            title={lang === 'es' ? 'Visitar perfil de Instagram (@planet_talent_agency)' : 'Visit Instagram profile (@planet_talent_agency)'}
-          >
-            <Instagram className="w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-300 ease-out" aria-hidden="true" />
-          </a>
-        </motion.div>
+          <p className="text-[11px] sm:text-xs tracking-[0.14em] uppercase text-white/65 font-light leading-relaxed">
+            {lang === 'es' ? (
+              <>
+                La agencia oficial de los videos de{' '}
+                <span className="text-white font-medium">Planet Records</span>
+                <span className="text-[#CC0000] mx-2 font-bold" aria-hidden="true">·</span>
+                Partner de <span className="text-white/90 font-medium">Getty Images</span>,{' '}
+                <span className="text-white/90 font-medium">Adobe</span>,{' '}
+                <span className="text-white/90 font-medium">Premios Lucas</span> y más
+              </>
+            ) : (
+              <>
+                Official agency for{' '}
+                <span className="text-white font-medium">Planet Records</span> music videos
+                <span className="text-[#CC0000] mx-2 font-bold" aria-hidden="true">·</span>
+                Partner of <span className="text-white/90 font-medium">Getty Images</span>,{' '}
+                <span className="text-white/90 font-medium">Adobe</span>,{' '}
+                <span className="text-white/90 font-medium">Premios Lucas</span> &amp; more
+              </>
+            )}
+          </p>
+        </div>
 
-        <motion.p 
-          variants={{
-            hidden: { opacity: 0, y: 20 },
-            visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
-          }}
-          className="text-[10px] md:text-xs text-white/30 tracking-wider flex-1 text-center md:text-right py-0.5"
-        >
-          {TRANSLATIONS[lang].footerText}
-        </motion.p>
+        <div className="flex flex-col items-center justify-between gap-2 md:flex-row md:gap-6">
+          <motion.div 
+            variants={{
+              hidden: { opacity: 0, y: 20 },
+              visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
+            }}
+            onClick={() => {
+              setShowManagerLogin(true);
+              setLoginError('');
+            }}
+            className="font-sans text-[10px] md:text-xs tracking-[0.2em] uppercase text-[#8A8A8A] font-medium flex-1 text-center md:text-left cursor-pointer hover:text-white transition-colors py-0.5 flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 justify-center md:justify-start"
+          >
+            <span>PLANET<span className="text-[#CC0000]">TALENT</span> · {TRANSLATIONS[lang].agency}</span>
+            <span className="hidden sm:inline text-white/20">|</span>
+            <span className="text-white/40 text-[9px] sm:text-[10px] tracking-wider font-normal">
+              {lang === 'es' ? 'Agencia de Modelos #1 de Cuba' : "Cuba's #1 Model Agency"}
+            </span>
+          </motion.div>
+          
+          {/* REDES SOCIALES */}
+          <motion.div 
+            variants={{
+              hidden: { opacity: 0, y: 20 },
+              visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
+            }}
+            className="flex items-center justify-center gap-3 sm:gap-5"
+          >
+            <a 
+              href="mailto:talent@planetrecords.it" 
+              className="p-1 text-[#8A8A8A] hover:text-white hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.7)] transition-all duration-300 ease-out transform hover:scale-125 active:scale-95 inline-flex items-center justify-center cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-black" 
+              aria-label={lang === 'es' ? 'Contactar por correo electrónico a Planet Talent' : 'Contact Planet Talent via email'}
+              title={lang === 'es' ? 'Contactar por email (talent@planetrecords.it)' : 'Contact via email (talent@planetrecords.it)'}
+            >
+              <Mail className="w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-300 ease-out" aria-hidden="true" />
+            </a>
+            <a 
+              href="https://www.instagram.com/planet_talent_agency?igsh=MTUzZzhwZzV5Yng0ZA==" 
+              target="_blank" 
+              rel="noopener noreferrer" 
+              className="p-1 text-[#8A8A8A] hover:text-white hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.7)] transition-all duration-300 ease-out transform hover:scale-125 active:scale-95 inline-flex items-center justify-center cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-black" 
+              aria-label={lang === 'es' ? 'Visitar perfil oficial de Instagram de Planet Talent Agency' : 'Visit Planet Talent Agency official Instagram profile'}
+              title={lang === 'es' ? 'Visitar perfil de Instagram (@planet_talent_agency)' : 'Visit Instagram profile (@planet_talent_agency)'}
+            >
+              <Instagram className="w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-300 ease-out" aria-hidden="true" />
+            </a>
+          </motion.div>
+
+          <motion.p 
+            variants={{
+              hidden: { opacity: 0, y: 20 },
+              visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } }
+            }}
+            className="text-[10px] md:text-xs text-white/30 tracking-wider flex-1 text-center md:text-right py-0.5"
+          >
+            {TRANSLATIONS[lang].footerText}
+          </motion.p>
+        </div>
       </motion.footer>
-        </>
-      )}
 
       {/* MODAL DE LOGIN MANAGER (FASE 1) */}
-      <AnimatePresence>
-        {showManagerLogin && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4 bg-black/95 backdrop-blur-xl"
-          >
-            {/* Logo encima del modal sin fondo blanco */}
-            <div className="mb-6 sm:mb-8 flex flex-col items-center">
-              <img 
-                src="/Logo de Planet Talent.PNG" 
-                alt="Planet Talent" 
-                className="h-10 sm:h-12 md:h-14 w-auto object-contain block drop-shadow-xl" 
-              />
-            </div>
-
-            <motion.div
-              initial={{ scale: 0.95, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-[#0A0A0A] border border-white/10 p-8 rounded-sm w-full max-w-md relative"
-            >
-              <button
-                onClick={() => setShowManagerLogin(false)}
-                className="absolute top-6 right-6 text-[#8A8A8A] hover:text-white transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-
-              <div className="mb-8 text-center mt-2">
-                <h3 className="font-sans text-xl tracking-wide font-medium text-white mb-2 uppercase">{TRANSLATIONS[lang].managerAccess}</h3>
-                <p className="text-xs text-gray-400">{TRANSLATIONS[lang].cmsSubtitle}</p>
-              </div>
-
-              <form onSubmit={handleLogin} className="flex flex-col gap-5">
-                <div className="flex flex-col gap-2 relative">
-                  <label className="text-[10px] tracking-widest uppercase text-gray-200 font-bold">{TRANSLATIONS[lang].email}</label>
-                  <input
-                    type="email"
-                    required
-                    autoComplete="username"
-                    value={managerEmail}
-                    onChange={(e) => setManagerEmail(e.target.value)}
-                    className="w-full bg-white border border-gray-300 px-4 py-3 text-sm text-black placeholder:text-gray-400 rounded-sm focus:outline-none focus:border-[#CC0000] transition-colors"
-                    placeholder={TRANSLATIONS[lang].emailPlaceholder}
-                  />
-                </div>
-
-                <div className="flex flex-col gap-2 relative">
-                  <label className="text-[10px] tracking-widest uppercase text-gray-200 font-bold">{TRANSLATIONS[lang].password}</label>
-                  <input
-                    type="password"
-                    required
-                    autoComplete="current-password"
-                    value={managerPassword}
-                    onChange={(e) => setManagerPassword(e.target.value)}
-                    className="w-full bg-white border border-gray-300 px-4 py-3 text-sm text-black placeholder:text-gray-400 rounded-sm focus:outline-none focus:border-[#CC0000] transition-colors"
-                    placeholder={TRANSLATIONS[lang].passwordPlaceholder}
-                  />
-                </div>
-
-                {loginError && (
-                  <p className="text-[#CC0000] text-[10px] tracking-wider mt-1 text-center font-bold max-w-xs mx-auto leading-tight">{loginError}</p>
-                )}
-
-                <button
-                  type="submit"
-                  disabled={loginLoading}
-                  className="w-full py-4 bg-[#CC0000] hover:bg-[#CC0000]/90 disabled:opacity-50 text-white rounded-sm text-xs uppercase tracking-wider font-bold transition-all mt-4"
-                >
-                  {loginLoading ? '...' : TRANSLATIONS[lang].enterPanel}
-                </button>
-              </form>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {managerLoginModal}
 
       {/* Modal Guía de Niveles */}
       <AnimatePresence>

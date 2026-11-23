@@ -12,6 +12,7 @@ import { Model } from '../types';
 
 // In-memory cache for dynamically optimized base64 data URLs
 const memoryOptimizedCache = new Map<string, string>();
+const memoryThumbnailCache = new Map<string, string>();
 
 /**
  * Check if the browser supports canvas export to WebP
@@ -232,10 +233,12 @@ export const compressDataUrl = async (
   });
 };
 
+
+
 /**
- * Optimizes external URLs (e.g. Unsplash, Cloudinary, Imgix) with WebP and auto-formatting
+ * Optimizes external URLs (e.g. Unsplash, Supabase, Cloudinary) with WebP and auto-formatting
  */
-export const optimizeExternalUrl = (url: string): string => {
+export const optimizeExternalUrl = (url: string, type: 'full' | 'thumb' = 'full'): string => {
   if (!url || typeof url !== 'string') return url;
 
   // Unsplash URLs
@@ -244,8 +247,10 @@ export const optimizeExternalUrl = (url: string): string => {
       const parsed = new URL(url);
       parsed.searchParams.set('auto', 'format');
       parsed.searchParams.set('fit', 'crop');
-      if (!parsed.searchParams.has('w')) parsed.searchParams.set('w', '900');
-      if (!parsed.searchParams.has('q')) parsed.searchParams.set('q', '80');
+      const targetW = type === 'thumb' ? '600' : '900';
+      const targetQ = type === 'thumb' ? '75' : '80';
+      parsed.searchParams.set('w', targetW);
+      parsed.searchParams.set('q', targetQ);
       if (isWebPSupported() && !parsed.searchParams.has('fm')) {
         parsed.searchParams.set('fm', 'webp');
       }
@@ -260,21 +265,22 @@ export const optimizeExternalUrl = (url: string): string => {
 
 /**
  * Returns an optimized photo string (WebP/optimized URL/cached WebP Base64).
- * If a raw uncompressed heavy base64 string is encountered, schedules background
- * WebP conversion and caching so the DOM doesn't stutter.
+ * Supports 'full' or lightweight 'thumb' (~600px).
  */
-export const getOptimizedPhotoUrl = (rawPhoto: string | undefined | null): string | undefined => {
+export const getOptimizedPhotoUrl = (rawPhoto: string | undefined | null, type: 'full' | 'thumb' = 'full'): string | undefined => {
   if (!rawPhoto) return undefined;
 
-  // 1. If it's already in the in-memory cache, return the cached WebP immediately
-  if (memoryOptimizedCache.has(rawPhoto)) {
-    return memoryOptimizedCache.get(rawPhoto);
+  const targetCache = type === 'thumb' ? memoryThumbnailCache : memoryOptimizedCache;
+
+  // 1. If it's already in the target cache, return immediately
+  if (targetCache.has(rawPhoto)) {
+    return targetCache.get(rawPhoto);
   }
 
   // 2. If it's an external HTTP/HTTPS URL, optimize parameters
   if (rawPhoto.startsWith('http://') || rawPhoto.startsWith('https://')) {
-    const optimized = optimizeExternalUrl(rawPhoto);
-    memoryOptimizedCache.set(rawPhoto, optimized);
+    const optimized = optimizeExternalUrl(rawPhoto, type);
+    targetCache.set(rawPhoto, optimized);
     return optimized;
   }
 
@@ -285,6 +291,19 @@ export const getOptimizedPhotoUrl = (rawPhoto: string | undefined | null): strin
 
   // 4. If it's a Base64 data URL
   if (rawPhoto.startsWith('data:')) {
+    if (type === 'thumb') {
+      // Schedule background thumbnail WebP compression (~600px)
+      compressDataUrl(rawPhoto, { maxWidth: 600, maxHeight: 800, quality: 0.75 })
+        .then(thumb => {
+          if (thumb && thumb.length < rawPhoto.length) {
+            memoryThumbnailCache.set(rawPhoto, thumb);
+          }
+        })
+        .catch(() => {});
+
+      return rawPhoto;
+    }
+
     // If it's already lightweight WebP or small size (< 60KB), no need to compress further
     if (rawPhoto.startsWith('data:image/webp') || rawPhoto.length < 60000) {
       return rawPhoto;
@@ -303,6 +322,10 @@ export const getOptimizedPhotoUrl = (rawPhoto: string | undefined | null): strin
   }
 
   return rawPhoto;
+};
+
+export const getThumbnailPhotoUrl = (rawPhoto: string | undefined | null): string | undefined => {
+  return getOptimizedPhotoUrl(rawPhoto, 'thumb');
 };
 
 /**

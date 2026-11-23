@@ -2,7 +2,7 @@ import { motion, AnimatePresence } from "motion/react";
 import React, { useState, useEffect, useRef } from 'react';
 import { toast, Toaster } from 'sonner';
 import { supabase, getCachedModels, getCachedBookings, invalidateModelsCache, invalidateBookingsCache } from '../lib/supabase';
-import { Model } from '../types';
+import { CastingApplication, CastingApplicationStatus, Model } from '../types';
 import { 
   Trash2, 
   Edit2, 
@@ -70,6 +70,81 @@ import {
   uploadImageToSupabaseStorage, 
   migrateAllBase64PhotosToStorage 
 } from '../lib/storage';
+import {
+  CASTING_EVENT_UPDATED,
+  CASTING_ONLY_PREVIEW_MODE,
+  CASTING_STORAGE_KEY,
+  fetchRemoteCastingConfig,
+  getCastingStatusInfo,
+  saveRemoteCastingEnabled,
+} from '../lib/castingConfig';
+import {
+  getLocalSubmittedCastingPhotos,
+  LocalCastingPhotoRecord,
+  matchLocalPhotosToApplication,
+} from '../lib/castingLocalPhotos';
+
+const protectedPhotoBlobCache = new Map<string, string>();
+
+const ProtectedCastingPhoto: React.FC<{
+  src: string;
+  alt: string;
+  className?: string;
+  accessToken?: string;
+}> = ({ src, alt, className, accessToken }) => {
+  const needsAuthFetch = src.startsWith('/api/casting-photos/');
+  const [resolvedSrc, setResolvedSrc] = useState<string>(() => {
+    if (!needsAuthFetch) return src;
+    return protectedPhotoBlobCache.get(src) || '';
+  });
+
+  useEffect(() => {
+    if (!needsAuthFetch) {
+      setResolvedSrc(src);
+      return;
+    }
+    const cached = protectedPhotoBlobCache.get(src);
+    if (cached) {
+      setResolvedSrc(cached);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        let token = accessToken;
+        if (!token) {
+          const { data: { session } } = await supabase.auth.getSession();
+          token = session?.access_token;
+        }
+        if (!token) return;
+        const res = await fetch(src, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        protectedPhotoBlobCache.set(src, objectUrl);
+        if (!cancelled) {
+          setResolvedSrc(objectUrl);
+        }
+      } catch {
+        // ignore image fetch failure
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [src, needsAuthFetch, accessToken]);
+
+  if (!resolvedSrc) {
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-zinc-900 text-zinc-500">
+        <Loader2 className="w-4 h-4 animate-spin" />
+      </div>
+    );
+  }
+  return <img src={resolvedSrc} alt={alt} className={className} />;
+};
 
 const WhatsAppIcon = ({ className = "w-4 h-4" }: { className?: string }) => (
   <svg 
@@ -160,11 +235,13 @@ interface ManagerDashboardProps {
 
 export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
   const [models, setModels] = useState<Model[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!CASTING_ONLY_PREVIEW_MODE);
   const [modelsError, setModelsError] = useState<string>('');
 
   // Tabs & Views State
-  const [activeTab, setActiveTab] = useState<'models' | 'bookings' | 'stats'>('models');
+  const [activeTab, setActiveTab] = useState<'models' | 'bookings' | 'casting' | 'stats'>(
+    CASTING_ONLY_PREVIEW_MODE ? 'casting' : 'models'
+  );
   const [viewMode, setViewMode] = useState<'grid' | 'table'>('grid');
   const [showMobileFilters, setShowMobileFilters] = useState(false);
   const [isStatsExpanded, setIsStatsExpanded] = useState(true);
@@ -174,6 +251,55 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
   const [bookingFilter, setBookingFilter] = useState<'all' | 'pendiente' | 'aceptado' | 'rechazado' | 'archivado'>('all');
   const [bookingViewMode, setBookingViewMode] = useState<'detail' | 'list'>('detail');
   const [selectedBookingId, setSelectedBookingId] = useState<number | null>(null);
+
+  // Casting Tab State
+  const [castingApplications, setCastingApplications] = useState<CastingApplication[]>([]);
+  const [castingAccessToken, setCastingAccessToken] = useState<string>('');
+  const [loadingCasting, setLoadingCasting] = useState<boolean>(false);
+  const [castingError, setCastingError] = useState<string>('');
+  const [castingStatusFilter, setCastingStatusFilter] = useState<'all' | CastingApplicationStatus>('all');
+  const [castingSubView, setCastingSubView] = useState<'applicants' | 'schedule'>('applicants');
+  const [rosterScope, setRosterScope] = useState<'attending' | 'pre_selected' | 'selected' | 'all'>('attending');
+  const [rosterSort, setRosterSort] = useState<'arrival' | 'alpha'>('arrival');
+  const [scheduleDaysMode, setScheduleDaysMode] = useState<'both' | 'day1' | 'day2'>('both');
+  const [scheduleStartTime, setScheduleStartTime] = useState<string>('09:00');
+  const [scheduleSlotMinutes, setScheduleSlotMinutes] = useState<number>(15);
+  const [schedulePerSlot, setSchedulePerSlot] = useState<number>(2);
+  const [exportingCastingPdf, setExportingCastingPdf] = useState<boolean>(false);
+  const [previewCastingPhotos, setPreviewCastingPhotos] = useState<{ cara: string; cuerpo: string; nombre: string } | null>(null);
+  const [updatingCastingId, setUpdatingCastingId] = useState<number | null>(null);
+  const [castingStatus, setCastingStatus] = useState(() => getCastingStatusInfo());
+
+  useEffect(() => {
+    const syncCasting = () => setCastingStatus(getCastingStatusInfo());
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === CASTING_STORAGE_KEY || e.key === null) syncCasting();
+    };
+    fetchRemoteCastingConfig().then(syncCasting);
+    window.addEventListener(CASTING_EVENT_UPDATED, syncCasting);
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener(CASTING_EVENT_UPDATED, syncCasting);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
+  const handleToggleCasting = async () => {
+    const nextEnabled = !castingStatus.enabled;
+    const result = await saveRemoteCastingEnabled(nextEnabled);
+    setCastingStatus(getCastingStatusInfo());
+    if (!result.ok) {
+      toast.warning(
+        `Estado cambiado localmente, pero Supabase rechazó el guardado (${result.error || 'requiere sesión en Supabase Auth'}).`
+      );
+      return;
+    }
+    toast.success(
+      nextEnabled
+        ? 'Convocatoria de Casting activada en la web pública'
+        : 'Convocatoria de Casting pausada en la web pública'
+    );
+  };
   
   // Modal State
   const [showModal, setShowModal] = useState(false);
@@ -417,6 +543,11 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
   };
 
   useEffect(() => {
+    fetchCastingApplications(false);
+    if (CASTING_ONLY_PREVIEW_MODE) {
+      return;
+    }
+
     fetchModels();
     fetchBookings(false, false);
 
@@ -427,6 +558,356 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
 
     return () => clearInterval(interval);
   }, []);
+
+  const fetchCastingApplications = async (silent = false) => {
+    if (!silent) {
+      setLoadingCasting(true);
+    }
+    setCastingError('');
+    try {
+      const { data: { session: authSession } } = await supabase.auth.getSession();
+      if (!authSession) {
+        setCastingAccessToken('');
+        setCastingApplications([]);
+        setCastingError(
+          'Debes iniciar sesión con un usuario administrador de Supabase Auth (Authentication → Users) para leer las postulaciones protegidas por RLS.'
+        );
+        return;
+      }
+
+      setCastingAccessToken(authSession.access_token);
+
+      const [{ data, error }, serverIndexRes] = await Promise.all([
+        supabase
+          .from('casting_applications')
+          .select('*')
+          .order('created_at', { ascending: false }),
+        fetch('/api/casting-photos/index', {
+          headers: { Authorization: `Bearer ${authSession.access_token}` },
+        })
+          .then((r) => (r.ok ? r.json() : { records: [] }))
+          .catch(() => ({ records: [] })),
+      ]);
+
+      if (error) throw error;
+
+      const serverRecords: LocalCastingPhotoRecord[] = Array.isArray(serverIndexRes?.records)
+        ? serverIndexRes.records
+        : [];
+      const browserLocalRecords = getLocalSubmittedCastingPhotos();
+      const combinedPhotoRecords = [...serverRecords, ...browserLocalRecords];
+
+      const enriched = ((data as CastingApplication[]) || []).map((app) => {
+        const matched = matchLocalPhotosToApplication(app, combinedPhotoRecords);
+        return {
+          ...app,
+          foto_cara: matched.fotoCara || app.foto_cara || '',
+          foto_cuerpo: matched.fotoCuerpo || app.foto_cuerpo || '',
+        };
+      });
+
+      setCastingApplications(enriched);
+    } catch (err: any) {
+      console.error('Error fetching casting applications:', err);
+      setCastingError(
+        err?.message || 'No se pudieron cargar las postulaciones de casting.'
+      );
+    } finally {
+      if (!silent) {
+        setLoadingCasting(false);
+      }
+    }
+  };
+
+  const updateCastingApplicationStatus = async (
+    id: number,
+    nextStatus: CastingApplicationStatus
+  ) => {
+    setUpdatingCastingId(id);
+    try {
+      const { error } = await supabase
+        .from('casting_applications')
+        .update({ estado: nextStatus })
+        .eq('id', id);
+
+      if (error) throw error;
+      setCastingApplications((prev) =>
+        prev.map((app) => (app.id === id ? { ...app, estado: nextStatus } : app))
+      );
+      toast.success(`Estado actualizado a ${nextStatus}`);
+    } catch (err: any) {
+      console.error('Error updating casting status:', err);
+      toast.error(err?.message || 'No se pudo actualizar el estado');
+    } finally {
+      setUpdatingCastingId(null);
+    }
+  };
+
+  const deleteCastingApplication = async (id: number) => {
+    const targetApp = castingApplications.find((a) => a.id === id);
+    setUpdatingCastingId(id);
+    try {
+      const { error } = await supabase
+        .from('casting_applications')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+
+      if (targetApp) {
+        try {
+          const { data: { session: authSession } } = await supabase.auth.getSession();
+          if (authSession?.access_token) {
+            await fetch('/api/casting-photos', {
+              method: 'DELETE',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authSession.access_token}`,
+              },
+              body: JSON.stringify({
+                correo: targetApp.correo,
+                instagram: targetApp.instagram,
+                fotoCaraUrl: targetApp.foto_cara || '',
+                fotoCuerpoUrl: targetApp.foto_cuerpo || '',
+              }),
+            });
+          }
+        } catch {
+          // ignore local photo cleanup errors
+        }
+      }
+
+      setCastingApplications((prev) => prev.filter((app) => app.id !== id));
+      toast.success('Postulación eliminada');
+    } catch (err: any) {
+      console.error('Error deleting casting application:', err);
+      toast.error(err?.message || 'No se pudo eliminar la postulación');
+    } finally {
+      setUpdatingCastingId(null);
+    }
+  };
+
+  // Estadísticas, Listado de asistencia y Horario automático de Casting (28 y 29 Nov)
+  const castingCounts = React.useMemo(() => {
+    const total = castingApplications.length;
+    const pendientes = castingApplications.filter((a) => a.estado === 'pendiente').length;
+    const preseleccionadas = castingApplications.filter((a) => a.estado === 'preseleccionada').length;
+    const seleccionadas = castingApplications.filter((a) => a.estado === 'seleccionada').length;
+    const descartadas = castingApplications.filter((a) => a.estado === 'descartada').length;
+    const asistentes = total - descartadas;
+    const conTutor = castingApplications.filter((a) => a.edad === 17 && a.estado !== 'descartada').length;
+    return { total, pendientes, preseleccionadas, seleccionadas, descartadas, asistentes, conTutor };
+  }, [castingApplications]);
+
+  const scheduledCastingRoster = React.useMemo(() => {
+    let list = castingApplications.filter((app) => {
+      if (rosterScope === 'attending') return app.estado !== 'descartada';
+      if (rosterScope === 'pre_selected') return app.estado === 'preseleccionada' || app.estado === 'seleccionada';
+      if (rosterScope === 'selected') return app.estado === 'seleccionada';
+      return true;
+    });
+
+    if (rosterSort === 'alpha') {
+      list = [...list].sort((a, b) =>
+        `${a.nombre} ${a.apellidos}`.localeCompare(`${b.nombre} ${b.apellidos}`, 'es')
+      );
+    } else {
+      list = [...list].sort((a, b) => {
+        const ta = a.created_at ? new Date(a.created_at).getTime() : a.id;
+        const tb = b.created_at ? new Date(b.created_at).getTime() : b.id;
+        return ta - tb;
+      });
+    }
+
+    const [startHStr, startMStr] = (scheduleStartTime || '09:00').split(':');
+    const baseMinutes = (Number(startHStr) || 9) * 60 + (Number(startMStr) || 0);
+    const slotDuration = Math.max(5, scheduleSlotMinutes || 15);
+    const perSlot = Math.max(1, schedulePerSlot || 1);
+
+    const formatClock = (totalMins: number) => {
+      const clamped = totalMins % (24 * 60);
+      const hh = Math.floor(clamped / 60);
+      const mm = clamped % 60;
+      const period = hh >= 12 ? 'PM' : 'AM';
+      const hh12 = hh % 12 === 0 ? 12 : hh % 12;
+      return `${String(hh12).padStart(2, '0')}:${String(mm).padStart(2, '0')} ${period}`;
+    };
+
+    const splitIndex = scheduleDaysMode === 'both' ? Math.ceil(list.length / 2) : list.length;
+
+    return list.map((app, index) => {
+      let dayLabel = 'Sábado 28 Nov';
+      let indexInDay = index;
+      if (scheduleDaysMode === 'day2') {
+        dayLabel = 'Domingo 29 Nov';
+      } else if (scheduleDaysMode === 'both' && index >= splitIndex) {
+        dayLabel = 'Domingo 29 Nov';
+        indexInDay = index - splitIndex;
+      }
+
+      const slotIndex = Math.floor(indexInDay / perSlot);
+      const startMins = baseMinutes + slotIndex * slotDuration;
+      const endMins = startMins + slotDuration;
+
+      return {
+        order: index + 1,
+        dayLabel,
+        timeRange: `${formatClock(startMins)} – ${formatClock(endMins)}`,
+        startTime: formatClock(startMins),
+        app,
+      };
+    });
+  }, [castingApplications, rosterScope, rosterSort, scheduleDaysMode, scheduleStartTime, scheduleSlotMinutes, schedulePerSlot]);
+
+  const handleCopyNamesRoster = async () => {
+    if (scheduledCastingRoster.length === 0) {
+      toast.error('No hay candidatas en este listado');
+      return;
+    }
+    const lines = [
+      `LISTADO DE CANDIDATAS — CASTING PLANET TALENT (${scheduledCastingRoster.length} candidatas)`,
+      'Estudio 50 · Calle Lugareño esq. Almendares, Vedado, Plaza de la Revolución, La Habana',
+      '',
+      ...scheduledCastingRoster.map(
+        (item) =>
+          `${item.order}. ${item.app.nombre} ${item.app.apellidos}${item.app.edad === 17 ? ' (17 años - con tutor)' : ''}`
+      ),
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      toast.success(`Listado de ${scheduledCastingRoster.length} nombres copiado`);
+    } catch {
+      toast.error('No se pudo copiar el listado');
+    }
+  };
+
+  const handleCopyScheduleText = async () => {
+    if (scheduledCastingRoster.length === 0) {
+      toast.error('No hay candidatas en el horario');
+      return;
+    }
+    const day1 = scheduledCastingRoster.filter((i) => i.dayLabel === 'Sábado 28 Nov');
+    const day2 = scheduledCastingRoster.filter((i) => i.dayLabel === 'Domingo 29 Nov');
+    const lines: string[] = [
+      'HORARIO DE ATENCIÓN — CASTING PLANET TALENT',
+      `Sede: Estudio 50 (Calle Lugareño esq. Almendares, Vedado, Plaza de la Revolución) · Total citadas: ${scheduledCastingRoster.length}`,
+      '',
+    ];
+    if (day1.length > 0) {
+      lines.push(`📅 SÁBADO 28 DE NOVIEMBRE (${day1.length} candidatas)`);
+      day1.forEach((item) => {
+        lines.push(
+          `• ${item.startTime} — ${item.app.nombre} ${item.app.apellidos}${item.app.edad === 17 ? ' [17 años · Tutor]' : ''}`
+        );
+      });
+      lines.push('');
+    }
+    if (day2.length > 0) {
+      lines.push(`📅 DOMINGO 29 DE NOVIEMBRE (${day2.length} candidatas)`);
+      day2.forEach((item) => {
+        lines.push(
+          `• ${item.startTime} — ${item.app.nombre} ${item.app.apellidos}${item.app.edad === 17 ? ' [17 años · Tutor]' : ''}`
+        );
+      });
+    }
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      toast.success('Horario completo copiado al portapapeles');
+    } catch {
+      toast.error('No se pudo copiar el horario');
+    }
+  };
+
+  const exportCastingSchedulePDF = async () => {
+    if (scheduledCastingRoster.length === 0) {
+      toast.error('No hay candidatas para exportar');
+      return;
+    }
+    setExportingCastingPdf(true);
+    const toastId = toast.loading('Generando PDF de Listado y Horario...');
+    try {
+      const { jsPDF } = await import('jspdf');
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      const drawHeader = (pageNum: number) => {
+        doc.setFillColor(12, 12, 15);
+        doc.rect(0, 0, 210, 26, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(13);
+        doc.text('CASTING PLANET TALENT — LISTADO Y HORARIO', 14, 11);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(220, 220, 220);
+        doc.text(
+          `Sede: Estudio 50 (Vedado, Plaza de la Revolución)  |  Citadas: ${scheduledCastingRoster.length}  |  Con tutor (17 años): ${
+            scheduledCastingRoster.filter((i) => i.app.edad === 17).length
+          }`,
+          14,
+          18
+        );
+        doc.text(`Pág. ${pageNum}`, 196, 18, { align: 'right' });
+
+        // Column headers
+        doc.setFillColor(240, 240, 244);
+        doc.rect(12, 30, 186, 8, 'F');
+        doc.setTextColor(20, 20, 25);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.text('#', 15, 35.5);
+        doc.text('DÍA / HORA', 24, 35.5);
+        doc.text('NOMBRE Y APELLIDOS', 68, 35.5);
+        doc.text('EDAD / TUTOR', 132, 35.5);
+        doc.text('CONTACTO', 164, 35.5);
+        doc.text('ASIST.', 195, 35.5, { align: 'right' });
+      };
+
+      let pageNum = 1;
+      drawHeader(pageNum);
+      let y = 44;
+
+      scheduledCastingRoster.forEach((item) => {
+        if (y > 280) {
+          doc.addPage();
+          pageNum += 1;
+          drawHeader(pageNum);
+          y = 44;
+        }
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8.5);
+        doc.setTextColor(25, 25, 30);
+
+        const fullName = `${item.app.nombre} ${item.app.apellidos}`.slice(0, 32);
+        const ageText =
+          item.app.edad === 17 ? `${item.app.edad}a (Tutor)` : `${item.app.edad} años`;
+        const contactText = (item.app.whatsapp || item.app.instagram || '').slice(0, 18);
+
+        doc.text(String(item.order), 15, y);
+        doc.text(`${item.dayLabel === 'Sábado 28 Nov' ? 'Sáb 28' : 'Dom 29'} · ${item.startTime}`, 24, y);
+        doc.setFont('helvetica', 'bold');
+        doc.text(fullName, 68, y);
+        doc.setFont('helvetica', 'normal');
+        doc.text(ageText, 132, y);
+        doc.text(contactText, 164, y);
+
+        // Checkbox de asistencia presencial
+        doc.setDrawColor(120, 120, 130);
+        doc.rect(190, y - 3.3, 4, 4);
+
+        doc.setDrawColor(230, 230, 235);
+        doc.line(12, y + 2.5, 198, y + 2.5);
+        y += 8.5;
+      });
+
+      doc.save('Casting-Planet-Talent-Listado-Horario.pdf');
+      toast.success('PDF descargado correctamente', { id: toastId });
+    } catch (err: any) {
+      console.error('Error exporting casting PDF:', err);
+      toast.error('No se pudo generar el PDF', { id: toastId });
+    } finally {
+      setExportingCastingPdf(false);
+    }
+  };
 
   const fetchBookings = async (forceRefresh = false, silent = false) => {
     if (!silent) {
@@ -1482,15 +1963,19 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
             <div className="h-4 w-px bg-white/20 hidden sm:block shrink-0"></div>
             
             <h1 className="text-[11px] sm:text-xs md:text-sm font-semibold uppercase tracking-[0.15em] sm:tracking-[0.2em] text-[#E0E0E0] font-sans truncate min-w-0">
-              <span className="hidden md:inline">Panel de Administración</span>
-              <span className="inline md:hidden">Administración</span>
+              <span className="hidden md:inline">
+                {CASTING_ONLY_PREVIEW_MODE ? 'Gestión de Casting' : 'Panel de Administración'}
+              </span>
+              <span className="inline md:hidden">
+                {CASTING_ONLY_PREVIEW_MODE ? 'Casting' : 'Administración'}
+              </span>
             </h1>
           </div>
 
           {/* Top Actions: Booking Notification & Discreet Logout */}
           <div className="flex items-center gap-2 sm:gap-3 shrink-0 ml-2">
             {/* Quick Link to Bookings notification if pending */}
-            {pendingBookingsCount > 0 && (
+            {!CASTING_ONLY_PREVIEW_MODE && pendingBookingsCount > 0 && (
               <button
                 onClick={() => {
                   setActiveTab('bookings');
@@ -1526,13 +2011,25 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
             <div>
               <div className="flex items-center gap-2 mb-1.5">
                 <span className="w-1.5 h-4 bg-[#CC0000] inline-block rounded-full"></span>
-                <span className="text-[10px] uppercase tracking-[0.25em] text-[#CC0000] font-bold">Consola de Gestión</span>
+                <span className="text-[10px] uppercase tracking-[0.25em] text-[#CC0000] font-bold">
+                  {CASTING_ONLY_PREVIEW_MODE ? 'Convocatoria Oficial · Casting' : 'Consola de Gestión'}
+                </span>
               </div>
               <h1 className="text-2xl sm:text-3xl md:text-4xl font-serif font-light text-white tracking-tight">
-                Panel de <span className="italic text-[#CC0000] font-normal">Administración</span>
+                {CASTING_ONLY_PREVIEW_MODE ? (
+                  <>
+                    Panel de <span className="italic text-[#CC0000] font-normal">Casting</span>
+                  </>
+                ) : (
+                  <>
+                    Panel de <span className="italic text-[#CC0000] font-normal">Administración</span>
+                  </>
+                )}
               </h1>
               <p className="text-xs sm:text-sm text-[#A0A0A0] mt-1 max-w-2xl font-light">
-                Gestiona el catálogo oficial de modelos, atiende solicitudes de clientes en tiempo real y consulta métricas de popularidad.
+                {CASTING_ONLY_PREVIEW_MODE
+                  ? 'Gestiona las postulaciones recibidas, revisa sus fotos de cara y cuerpo completo, y genera el listado y horario de atención.'
+                  : 'Gestiona el catálogo oficial de modelos, atiende solicitudes de clientes en tiempo real y consulta métricas de popularidad.'}
               </p>
             </div>
 
@@ -1541,7 +2038,7 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
         </div>
 
         {/* PRIORITY ALERT BANNER: NEW PENDING BOOKING REQUESTS */}
-        {pendingBookingsCount > 0 && (
+        {!CASTING_ONLY_PREVIEW_MODE && pendingBookingsCount > 0 && (
           <motion.div 
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1578,59 +2075,78 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
         )}
 
         {/* TABS SELECTOR (MOBILE FIRST SEGMENTED CONTROL) */}
-        <div className="grid grid-cols-3 gap-1.5 bg-[#050505] border border-white/10 p-1.5 rounded-sm mb-6 max-w-xl">
-          <button
-            onClick={() => setActiveTab('models')}
-            className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-              activeTab === 'models'
-                ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
-                : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
-            }`}
-          >
-            <User className="w-3.5 h-3.5" />
-            <span className="truncate">Modelos ({totalModels})</span>
-          </button>
-          
-          <button
-            onClick={() => {
-              setActiveTab('bookings');
-              fetchBookings();
-            }}
-            className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 relative cursor-pointer ${
-              activeTab === 'bookings'
-                ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
-                : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
-            }`}
-          >
-            <Calendar className="w-3.5 h-3.5" />
-            <span className="truncate">Solicitudes</span>
-            {pendingBookingsCount > 0 && (
-              <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-amber-400 text-black text-[9px] font-black flex items-center justify-center animate-pulse">
-                {pendingBookingsCount}
-              </span>
-            )}
-          </button>
+        {!CASTING_ONLY_PREVIEW_MODE && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-[#050505] border border-white/10 p-1.5 rounded-sm mb-6 max-w-3xl">
+            <button
+              onClick={() => setActiveTab('models')}
+              className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activeTab === 'models'
+                  ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
+                  : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <User className="w-3.5 h-3.5" />
+              <span className="truncate">Modelos ({totalModels})</span>
+            </button>
+            
+            <button
+              onClick={() => {
+                setActiveTab('bookings');
+                fetchBookings();
+              }}
+              className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 relative cursor-pointer ${
+                activeTab === 'bookings'
+                  ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
+                  : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Calendar className="w-3.5 h-3.5" />
+              <span className="truncate">Solicitudes</span>
+              {pendingBookingsCount > 0 && (
+                <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-amber-400 text-black text-[9px] font-black flex items-center justify-center animate-pulse">
+                  {pendingBookingsCount}
+                </span>
+              )}
+            </button>
 
-          <button
-            onClick={() => {
-              setActiveTab('stats');
-              fetchBookings();
-            }}
-            className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-              activeTab === 'stats'
-                ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
-                : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
-            }`}
-          >
-            <Award className="w-3.5 h-3.5" />
-            <span className="truncate">Popularidad</span>
-          </button>
-        </div>
+            <button
+              id="manager-tab-casting"
+              onClick={() => {
+                setActiveTab('casting');
+                fetchCastingApplications();
+              }}
+              className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activeTab === 'casting'
+                  ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
+                  : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span className="truncate">Casting ({castingApplications.length})</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setActiveTab('stats');
+                fetchBookings();
+              }}
+              className={`py-3 px-2 rounded-sm text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activeTab === 'stats'
+                  ? 'bg-[#8B1A1A] text-white shadow-sm border border-[#A82525]/40'
+                  : 'text-[#B0B0B0] hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Award className="w-3.5 h-3.5" />
+              <span className="truncate">Popularidad</span>
+            </button>
+          </div>
+        )}
 
         {/* METRICS BENTO GRID (RESPONSIVE) */}
-        <div className="mb-8">
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4">
-            {activeTab === 'models' ? (
+        {!CASTING_ONLY_PREVIEW_MODE && activeTab !== 'casting' && (
+          <div className="mb-8">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4">
+              {activeTab === 'models' ? (
             <>
               <div className="bg-[#0A0A0A] border border-white/5 hover:border-[#CC0000]/30 transition-all p-4 sm:p-5 rounded-sm flex items-center justify-between group">
                 <div>
@@ -1669,7 +2185,50 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                 </div>
               </div>
             </>
-          ) : activeTab === 'bookings' ? (
+          ) : (CASTING_ONLY_PREVIEW_MODE || activeTab === 'casting') ? (
+            <>
+              <div className="bg-[#0A0A0A] border border-white/5 hover:border-[#CC0000]/30 transition-all p-4 sm:p-5 rounded-sm flex items-center justify-between group">
+                <div>
+                  <p className="text-[9px] sm:text-[10px] uppercase tracking-[0.2em] text-[#A0A0A0] font-semibold">Postulantes</p>
+                  <h3 className="text-2xl sm:text-3xl font-sans font-bold text-white mt-1 tabular-nums">{castingApplications.length}</h3>
+                  <span className="text-[10px] text-[#888] font-mono mt-0.5 block">
+                    {castingApplications.filter((a) => a.estado === 'pendiente').length} pendientes
+                  </span>
+                </div>
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-white/5 border border-white/5 flex items-center justify-center shrink-0">
+                  <User className="w-4 h-4 text-[#CC0000]" />
+                </div>
+              </div>
+
+              <div className="bg-[#0A0A0A] border border-white/5 hover:border-amber-500/30 transition-all p-4 sm:p-5 rounded-sm flex items-center justify-between group">
+                <div>
+                  <p className="text-[9px] sm:text-[10px] uppercase tracking-[0.2em] text-amber-300 font-semibold">Preseleccionadas</p>
+                  <h3 className="text-2xl sm:text-3xl font-sans font-bold text-amber-400 mt-1 tabular-nums">
+                    {castingApplications.filter((a) => a.estado === 'preseleccionada').length}
+                  </h3>
+                  <span className="text-[10px] text-amber-400/80 font-mono mt-0.5 block">En evaluación</span>
+                </div>
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center shrink-0">
+                  <Star className="w-4 h-4 text-amber-400" />
+                </div>
+              </div>
+
+              <div className="col-span-2 sm:col-span-1 bg-[#0A0A0A] border border-white/5 hover:border-emerald-500/30 transition-all p-4 sm:p-5 rounded-sm flex items-center justify-between group">
+                <div>
+                  <p className="text-[9px] sm:text-[10px] uppercase tracking-[0.2em] text-emerald-400 font-semibold">Seleccionadas (Top 10)</p>
+                  <h3 className="text-2xl sm:text-3xl font-sans font-bold text-emerald-400 mt-1 tabular-nums">
+                    {castingApplications.filter((a) => a.estado === 'seleccionada').length} <span className="text-xs font-normal text-[#A0A0A0]">/ 10</span>
+                  </h3>
+                  <span className="text-[10px] text-emerald-400/80 font-mono mt-0.5 block">
+                    {castingApplications.filter((a) => a.estado === 'descartada').length} descartadas
+                  </span>
+                </div>
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                </div>
+              </div>
+            </>
+          ) : !CASTING_ONLY_PREVIEW_MODE && activeTab === 'bookings' ? (
             <>
               <div className="bg-[#0A0A0A] border border-white/5 hover:border-[#CC0000]/30 transition-all p-4 sm:p-5 rounded-sm flex items-center justify-between group">
                 <div>
@@ -1753,12 +2312,13 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                 </div>
               </div>
             </>
-          )}
+            )}
+            </div>
           </div>
-        </div>
+        )}
 
         {/* TAB VIEWS */}
-        {activeTab === 'models' ? (
+        {!CASTING_ONLY_PREVIEW_MODE && activeTab === 'models' ? (
           <>
             {/* CONTROLS BAR: SEARCH, FILTER, ADD MODEL */}
             <div className="flex flex-col gap-4 mb-6 sm:mb-8 bg-[#0A0A0A] border border-white/5 p-4 sm:p-5 rounded-sm">
@@ -2569,6 +3129,640 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
                   })}
               </div>
             )}
+          </>
+        ) : (CASTING_ONLY_PREVIEW_MODE || activeTab === 'casting') ? (
+          <>
+            {/* CASTING TAB: INTERRUPTOR + FILTROS + LISTA DE POSTULANTES */}
+            <div className="space-y-6">
+              {/* Interruptor Activo / Pausado de la convocatoria */}
+              <div
+                id="manager-casting-control"
+                className="bg-[#0A0A0A] border border-white/10 px-4 py-3.5 sm:px-5 sm:py-4 rounded-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="text-xs sm:text-sm font-semibold text-white tracking-wide">
+                      Convocatoria de Casting · 28 y 29 Nov (Estudio 50, Vedado)
+                    </span>
+                    <span className="text-white/25" aria-hidden="true">·</span>
+                    <span
+                      className={`text-[11px] font-medium ${
+                        castingStatus.expired
+                          ? 'text-amber-400'
+                          : castingStatus.active
+                          ? 'text-emerald-400'
+                          : 'text-[#A0A0A0]'
+                      }`}
+                    >
+                      {castingStatus.expired
+                        ? 'Oculta automáticamente (cierre de inscripciones 25 nov)'
+                        : castingStatus.active
+                        ? 'Visible en Hero, Barra de Navegación y Página #casting'
+                        : 'Pausada manualmente'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-[#8A8A8A] mt-0.5">
+                    Cierre automático de inscripciones en línea el 25 de noviembre · Puedes activar o pausar el casting en cualquier momento.
+                  </p>
+                </div>
+
+                <button
+                  id="toggle-casting-btn"
+                  type="button"
+                  role="switch"
+                  aria-checked={castingStatus.enabled}
+                  onClick={handleToggleCasting}
+                  className="inline-flex items-center gap-3 self-start sm:self-center shrink-0 px-3.5 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <span className="text-xs font-medium text-white/90">
+                    {castingStatus.enabled ? 'Activo' : 'Pausado'}
+                  </span>
+                  <span
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      castingStatus.enabled ? 'bg-[#CC0000]' : 'bg-white/20'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        castingStatus.enabled ? 'translate-x-4.5' : 'translate-x-1'
+                      }`}
+                    />
+                  </span>
+                </button>
+              </div>
+
+              {/* Resumen rápido: Cantidad de Postulantes */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="bg-[#0A0A0A] border border-white/10 rounded-sm p-3.5 sm:p-4">
+                  <p className="text-[10px] uppercase tracking-widest text-zinc-400 font-semibold">
+                    Total Postulantes
+                  </p>
+                  <p className="text-2xl sm:text-3xl font-bold text-white tabular-nums mt-1">
+                    {castingCounts.total}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">Formularios recibidos</p>
+                </div>
+
+                <div className="bg-[#0A0A0A] border border-emerald-500/25 rounded-sm p-3.5 sm:p-4">
+                  <p className="text-[10px] uppercase tracking-widest text-emerald-300 font-semibold">
+                    Se Presentarán (Aptas)
+                  </p>
+                  <p className="text-2xl sm:text-3xl font-bold text-white tabular-nums mt-1">
+                    {castingCounts.asistentes}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">
+                    Excluye descartadas ({castingCounts.descartadas})
+                  </p>
+                </div>
+
+                <div className="bg-[#0A0A0A] border border-[#E2BA57]/30 rounded-sm p-3.5 sm:p-4">
+                  <p className="text-[10px] uppercase tracking-widest text-[#FCE99F] font-semibold">
+                    Preseleccionadas / Selec.
+                  </p>
+                  <p className="text-2xl sm:text-3xl font-bold text-white tabular-nums mt-1">
+                    {castingCounts.preseleccionadas + castingCounts.seleccionadas}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">
+                    {castingCounts.preseleccionadas} pre · {castingCounts.seleccionadas} selec.
+                  </p>
+                </div>
+
+                <div className="bg-[#0A0A0A] border border-amber-500/25 rounded-sm p-3.5 sm:p-4">
+                  <p className="text-[10px] uppercase tracking-widest text-amber-300 font-semibold">
+                    17 Años (Con Tutor)
+                  </p>
+                  <p className="text-2xl sm:text-3xl font-bold text-white tabular-nums mt-1">
+                    {castingCounts.conTutor}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">Requieren acompañante</p>
+                </div>
+              </div>
+
+              {/* Selector de Sub-Vista + Actualizar */}
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-[#0A0A0A] border border-white/10 p-3 sm:p-4 rounded-sm">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCastingSubView('applicants')}
+                    className={`px-3.5 py-2 rounded-sm text-xs font-semibold uppercase tracking-wider border transition-colors cursor-pointer ${
+                      castingSubView === 'applicants'
+                        ? 'bg-[#CC0000] border-[#CC0000] text-white'
+                        : 'bg-white/5 border-white/10 text-zinc-300 hover:text-white'
+                    }`}
+                  >
+                    Fichas de Postulantes ({castingCounts.total})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCastingSubView('schedule')}
+                    className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-sm text-xs font-semibold uppercase tracking-wider border transition-colors cursor-pointer ${
+                      castingSubView === 'schedule'
+                        ? 'bg-[#E2BA57]/20 border-[#E2BA57] text-[#FCE99F]'
+                        : 'bg-white/5 border-white/10 text-zinc-300 hover:text-white'
+                    }`}
+                  >
+                    <Calendar className="w-3.5 h-3.5" />
+                    <span>Listado y Horario ({castingCounts.asistentes})</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => fetchCastingApplications(false)}
+                    disabled={loadingCasting}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm text-xs text-white/90 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingCasting ? 'animate-spin text-[#CC0000]' : ''}`} />
+                    <span>Actualizar</span>
+                  </button>
+                </div>
+              </div>
+
+              {castingSubView === 'applicants' && (
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar bg-[#0A0A0A] border border-white/10 p-3 rounded-sm">
+                  {(
+                    [
+                      { value: 'all', label: 'Todas' },
+                      { value: 'pendiente', label: 'Pendiente' },
+                      { value: 'preseleccionada', label: 'Preseleccionada' },
+                      { value: 'seleccionada', label: 'Seleccionada' },
+                      { value: 'descartada', label: 'Descartada' },
+                    ] as const
+                  ).map((opt) => {
+                    const count =
+                      opt.value === 'all'
+                        ? castingApplications.length
+                        : castingApplications.filter((a) => a.estado === opt.value).length;
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setCastingStatusFilter(opt.value)}
+                        className={`px-3 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider transition-all border shrink-0 whitespace-nowrap cursor-pointer ${
+                          castingStatusFilter === opt.value
+                            ? 'bg-[#8B1A1A] border-[#A82525]/40 text-white shadow-sm'
+                            : 'bg-white/5 border-white/10 hover:border-white/20 text-[#A0A0A0] hover:text-white'
+                        }`}
+                      >
+                        {opt.label} ({count})
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Contenido Principal */}
+              {loadingCasting ? (
+                <div className="flex flex-col justify-center items-center py-24 gap-4">
+                  <Loader2 className="w-10 h-10 text-[#CC0000] animate-spin" />
+                  <p className="text-xs uppercase tracking-widest text-zinc-300">
+                    Cargando postulaciones...
+                  </p>
+                </div>
+              ) : castingError ? (
+                <div className="bg-red-950/20 border border-red-500/20 rounded-sm p-6 sm:p-8 text-center max-w-2xl mx-auto space-y-3">
+                  <AlertCircle className="w-10 h-10 text-red-400 mx-auto" />
+                  <h4 className="text-lg font-semibold text-white">Configuración / Acceso de Casting</h4>
+                  <p className="text-xs sm:text-sm text-red-200/90 leading-relaxed">
+                    {castingError}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Asegúrate de haber ejecutado la sección de <code className="text-zinc-200">casting_applications</code> en <code className="text-zinc-200">supabase.sql</code> y de contar con sesión autenticada en Supabase Auth para leer/editar postulaciones protegidas por RLS.
+                  </p>
+                </div>
+              ) : castingSubView === 'schedule' ? (
+                /* SUB-VISTA: LISTADO CON NOMBRE Y APELLIDOS + HORARIO DE ATENCIÓN */
+                <div className="space-y-4">
+                  <div className="bg-[#0A0A0A] border border-white/10 rounded-sm p-4 sm:p-5 space-y-4">
+                    <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-base sm:text-lg font-bold text-white">
+                          Planificador de Listado y Horario de Atención
+                        </h3>
+                        <p className="text-xs text-zinc-400 mt-0.5">
+                          Organiza automáticamente a las {scheduledCastingRoster.length} candidatas seleccionadas para Estudio 50 (Vedado, Plaza de la Revolución) y exporta para mesa de entrada o WhatsApp.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleCopyNamesRoster}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/15 rounded-sm text-xs font-medium text-white cursor-pointer transition-colors"
+                        >
+                          <Copy className="w-3.5 h-3.5 text-[#E2BA57]" />
+                          <span>Copiar Nombres y Apellidos</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleCopyScheduleText}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 bg-emerald-600/15 hover:bg-emerald-600/25 border border-emerald-500/35 rounded-sm text-xs font-medium text-emerald-300 cursor-pointer transition-colors"
+                        >
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          <span>Copiar Horario (WhatsApp)</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={exportCastingSchedulePDF}
+                          disabled={exportingCastingPdf}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#CC0000] hover:bg-[#B30000] disabled:opacity-50 rounded-sm text-xs font-semibold text-white cursor-pointer transition-colors"
+                        >
+                          <FileDown className="w-3.5 h-3.5" />
+                          <span>{exportingCastingPdf ? 'Generando...' : 'Descargar PDF'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Controles de filtrado y cálculo de horario */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-3 border-t border-white/10">
+                      <div>
+                        <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                          Candidatas a incluir
+                        </label>
+                        <select
+                          value={rosterScope}
+                          onChange={(e) => setRosterScope(e.target.value as any)}
+                          className="w-full h-10 px-3 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                        >
+                          <option value="attending">Aptas (sin descartadas)</option>
+                          <option value="pre_selected">Preseleccionadas + Selec.</option>
+                          <option value="selected">Solo Seleccionadas</option>
+                          <option value="all">Todas las registradas</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                          Orden del listado
+                        </label>
+                        <select
+                          value={rosterSort}
+                          onChange={(e) => setRosterSort(e.target.value as any)}
+                          className="w-full h-10 px-3 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                        >
+                          <option value="arrival">Por orden de registro</option>
+                          <option value="alpha">Alfabético (A – Z)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                          Días de casting
+                        </label>
+                        <select
+                          value={scheduleDaysMode}
+                          onChange={(e) => setScheduleDaysMode(e.target.value as any)}
+                          className="w-full h-10 px-3 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                        >
+                          <option value="both">28 y 29 Nov (Repartidas)</option>
+                          <option value="day1">Solo Sábado 28 Nov</option>
+                          <option value="day2">Solo Domingo 29 Nov</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                          Hora de inicio
+                        </label>
+                        <input
+                          type="time"
+                          value={scheduleStartTime}
+                          onChange={(e) => setScheduleStartTime(e.target.value)}
+                          className="w-full h-10 px-3 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                            Min / bloque
+                          </label>
+                          <select
+                            value={scheduleSlotMinutes}
+                            onChange={(e) => setScheduleSlotMinutes(Number(e.target.value))}
+                            className="w-full h-10 px-2.5 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                          >
+                            <option value={5}>5 min</option>
+                            <option value={10}>10 min</option>
+                            <option value={15}>15 min</option>
+                            <option value={20}>20 min</option>
+                            <option value={30}>30 min</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-1.5">
+                            Cand / bloque
+                          </label>
+                          <select
+                            value={schedulePerSlot}
+                            onChange={(e) => setSchedulePerSlot(Number(e.target.value))}
+                            className="w-full h-10 px-2.5 bg-[#141418] border border-white/15 rounded-sm text-xs text-white focus:outline-none focus:border-[#E2BA57]"
+                          >
+                            <option value={1}>1</option>
+                            <option value={2}>2</option>
+                            <option value={3}>3</option>
+                            <option value={4}>4</option>
+                            <option value={5}>5</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {scheduledCastingRoster.length === 0 ? (
+                    <div className="bg-[#0A0A0A] border border-white/10 rounded-sm p-12 text-center space-y-2">
+                      <Calendar className="w-8 h-8 text-zinc-500 mx-auto" />
+                      <p className="text-sm font-medium text-white">No hay candidatas en este filtro</p>
+                      <p className="text-xs text-zinc-400">
+                        Cambia el filtro de "Candidatas a incluir" o espera nuevas postulaciones.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="bg-[#0A0A0A] border border-white/10 rounded-sm overflow-hidden">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-[#141418] border-b border-white/10 text-[10px] uppercase tracking-wider text-zinc-400">
+                              <th className="py-3 px-4">#</th>
+                              <th className="py-3 px-4">Día</th>
+                              <th className="py-3 px-4">Horario</th>
+                              <th className="py-3 px-4">Nombre y Apellidos</th>
+                              <th className="py-3 px-4">Edad / Tutor</th>
+                              <th className="py-3 px-4">Estatura</th>
+                              <th className="py-3 px-4">Contacto</th>
+                              <th className="py-3 px-4">Estado</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5 text-xs">
+                            {scheduledCastingRoster.map((item) => (
+                              <tr key={item.app.id} className="hover:bg-white/[0.02]">
+                                <td className="py-3 px-4 text-zinc-400 tabular-nums font-medium">
+                                  {item.order}
+                                </td>
+                                <td className="py-3 px-4 whitespace-nowrap font-medium text-zinc-200">
+                                  {item.dayLabel}
+                                </td>
+                                <td className="py-3 px-4 whitespace-nowrap font-semibold text-[#FCE99F] tabular-nums">
+                                  {item.timeRange}
+                                </td>
+                                <td className="py-3 px-4 font-semibold text-white whitespace-nowrap">
+                                  {item.app.nombre} {item.app.apellidos}
+                                </td>
+                                <td className="py-3 px-4 whitespace-nowrap">
+                                  <span className="text-zinc-200 tabular-nums">{item.app.edad} años</span>
+                                  {item.app.edad === 17 && (
+                                    <span className="ml-2 inline-block text-[10px] px-2 py-0.5 rounded-sm bg-[#E2BA57]/15 text-[#FCE99F] border border-[#E2BA57]/40 font-semibold">
+                                      Tutor
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-3 px-4 text-zinc-300 tabular-nums whitespace-nowrap">
+                                  {item.app.estatura} cm
+                                </td>
+                                <td className="py-3 px-4 text-zinc-300 whitespace-nowrap">
+                                  {item.app.whatsapp} · {item.app.instagram}
+                                </td>
+                                <td className="py-3 px-4 whitespace-nowrap">
+                                  <span className="text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded-sm border border-white/15 bg-white/5 text-zinc-200">
+                                    {item.app.estado}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : castingApplications.filter(
+                  (a) => castingStatusFilter === 'all' || a.estado === castingStatusFilter
+                ).length === 0 ? (
+                <div className="bg-[#0A0A0A] border border-white/10 rounded-sm p-14 text-center space-y-2">
+                  <Sparkles className="w-8 h-8 text-zinc-500 mx-auto" />
+                  <p className="text-sm font-medium text-white">No hay postulantes en esta vista</p>
+                  <p className="text-xs text-zinc-400">
+                    Las candidatas que completen el formulario en #casting aparecerán aquí.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 gap-4">
+                  {castingApplications
+                    .filter((a) => castingStatusFilter === 'all' || a.estado === castingStatusFilter)
+                    .map((app) => {
+                      const cleanWa = app.whatsapp.replace(/[^0-9]/g, '');
+                      const igClean = app.instagram.replace(/^@/, '').trim();
+                      const createdFormatted = app.created_at
+                        ? new Date(app.created_at).toLocaleDateString('es-ES', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : '—';
+                      const isUpdating = updatingCastingId === app.id;
+
+                      return (
+                        <div
+                          key={app.id}
+                          className="bg-[#0C0C0E] border border-white/10 hover:border-white/20 rounded-sm p-4 sm:p-5 space-y-4 transition-colors"
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                            <div className="flex items-start gap-3.5 min-w-0">
+                              {app.foto_cara ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreviewCastingPhotos({
+                                      cara: app.foto_cara || '',
+                                      cuerpo: app.foto_cuerpo || app.foto_cara || '',
+                                      nombre: `${app.nombre} ${app.apellidos}`,
+                                    })
+                                  }
+                                  className="w-14 h-16 rounded-sm overflow-hidden border border-white/20 shrink-0 bg-black hover:opacity-95 transition-opacity relative group cursor-pointer"
+                                  title="Ver fotos de cara y cuerpo"
+                                >
+                                  <ProtectedCastingPhoto
+                                    src={app.foto_cara}
+                                    alt={app.nombre}
+                                    className="w-full h-full object-cover"
+                                    accessToken={castingAccessToken}
+                                  />
+                                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                    <Eye className="w-4 h-4 text-white" />
+                                  </div>
+                                </button>
+                              ) : (
+                                <div className="w-14 h-16 rounded-sm bg-white/5 border border-white/10 flex items-center justify-center text-xs font-serif font-bold text-white/50 shrink-0">
+                                  {app.nombre[0]}
+                                </div>
+                              )}
+                              <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <h4 className="text-lg font-bold text-white">
+                                    {app.nombre} {app.apellidos}
+                                  </h4>
+                                  <span
+                                    className={`text-[10px] uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-sm border ${
+                                      app.estado === 'seleccionada'
+                                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/35'
+                                        : app.estado === 'preseleccionada'
+                                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/35'
+                                        : app.estado === 'descartada'
+                                        ? 'bg-rose-500/15 text-rose-300 border-rose-500/35'
+                                        : 'bg-white/5 text-zinc-200 border-white/15'
+                                    }`}
+                                  >
+                                    {app.estado}
+                                  </span>
+                                  {app.edad === 17 && (
+                                    <span className="text-[10px] uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-sm border bg-[#E2BA57]/15 text-[#FCE99F] border-[#E2BA57]/40">
+                                      17 años · Tutor
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-zinc-400 mt-1">
+                                  {app.ciudad} · {app.edad} años ({app.fecha_nacimiento}) · Postulada: {createdFormatted}
+                                </p>
+                                {(app.foto_cara || app.foto_cuerpo) && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setPreviewCastingPhotos({
+                                        cara: app.foto_cara || '',
+                                        cuerpo: app.foto_cuerpo || app.foto_cara || '',
+                                        nombre: `${app.nombre} ${app.apellidos}`,
+                                      })
+                                    }
+                                    className="mt-2 inline-flex items-center gap-1.5 text-[11px] text-[#E2BA57] hover:underline font-medium cursor-pointer"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>Ver Fotos (Cara y Cuerpo Completo)</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              {cleanWa && (
+                                <a
+                                  href={`https://wa.me/${cleanWa}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-sm text-xs font-medium"
+                                >
+                                  <WhatsAppIcon className="w-3.5 h-3.5" />
+                                  <span>{app.whatsapp}</span>
+                                </a>
+                              )}
+                              {igClean && (
+                                <a
+                                  href={`https://instagram.com/${encodeURIComponent(igClean)}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/15 rounded-sm text-xs font-medium"
+                                >
+                                  <Instagram className="w-3.5 h-3.5 text-[#FF6B6B]" />
+                                  <span>@{igClean}</span>
+                                </a>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Datos físicos y medidas */}
+                          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5 p-3 bg-black/50 border border-white/5 rounded-sm text-xs">
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Estatura</span>
+                              <span className={`font-semibold tabular-nums ${app.estatura < 165 ? 'text-amber-300' : 'text-white'}`}>
+                                {app.estatura} cm
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Medidas</span>
+                              <span className="font-semibold text-white tabular-nums">
+                                {app.busto ?? '—'} / {app.cintura ?? '—'} / {app.caderas ?? '—'}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Tallas / Calzado</span>
+                              <span className="font-semibold text-white">
+                                {app.talla_superior} · {app.talla_inferior} · #{app.calzado}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Cabello</span>
+                              <span className="font-semibold text-white">
+                                {app.color_cabello} ({app.largo_cabello})
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Ojos / Piel</span>
+                              <span className="font-semibold text-white">
+                                {app.color_ojos} · {app.tono_piel}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] uppercase text-zinc-400 block">Piercings / Tatuajes</span>
+                              <span className="font-semibold text-white">
+                                {app.tiene_piercings ? 'Piercing Sí' : 'Sin piercing'} ·{' '}
+                                {app.tiene_tatuajes ? 'Tatuaje Sí' : 'Sin tatuaje'}
+                              </span>
+                            </div>
+                          </div>
+
+                          {app.detalle_piercings_tatuajes && (
+                            <p className="text-xs text-zinc-300 bg-white/[0.02] border border-white/5 p-2.5 rounded-sm">
+                              <strong className="text-white">Detalle piercings/tatuajes:</strong>{' '}
+                              {app.detalle_piercings_tatuajes}
+                            </p>
+                          )}
+
+                          {/* Acciones de estado */}
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-white/5">
+                            <span className="text-xs text-zinc-400 truncate">{app.correo}</span>
+
+                            <div className="flex flex-wrap items-center gap-1.5 ml-auto">
+                              {(
+                                [
+                                  { id: 'pendiente', label: 'Pendiente' },
+                                  { id: 'preseleccionada', label: 'Preseleccionada' },
+                                  { id: 'seleccionada', label: 'Seleccionada' },
+                                  { id: 'descartada', label: 'Descartada' },
+                                ] as const
+                              ).map((st) => (
+                                <button
+                                  key={st.id}
+                                  type="button"
+                                  disabled={isUpdating || app.estado === st.id}
+                                  onClick={() => updateCastingApplicationStatus(app.id, st.id)}
+                                  className={`px-2.5 py-1.5 rounded-sm text-[11px] font-semibold uppercase tracking-wider border transition-colors cursor-pointer disabled:opacity-50 ${
+                                    app.estado === st.id
+                                      ? 'bg-[#8B1A1A] border-[#CC0000] text-white'
+                                      : 'bg-white/5 hover:bg-white/10 border-white/10 text-zinc-300 hover:text-white'
+                                  }`}
+                                >
+                                  {st.label}
+                                </button>
+                              ))}
+
+                              <button
+                                type="button"
+                                disabled={isUpdating}
+                                onClick={() => deleteCastingApplication(app.id)}
+                                title="Eliminar postulación"
+                                className="p-1.5 bg-white/5 hover:bg-red-500/20 text-neutral-400 hover:text-red-400 border border-white/10 rounded-sm transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
           </>
         ) : (
           <>
@@ -4193,6 +5387,75 @@ export function ManagerDashboard({ onLogout }: ManagerDashboardProps) {
               <ChevronUp className="w-5 h-5 text-[#CC0000] stroke-[1.75] transition-transform duration-300 group-hover:scale-110" />
             </motion.div>
           </motion.button>
+        )}
+      </AnimatePresence>
+      {/* MODAL DE PREVISUALIZACIÓN DE FOTOS DE CASTING */}
+      <AnimatePresence>
+        {previewCastingPhotos && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4 bg-black/95 backdrop-blur-xl"
+            onClick={() => setPreviewCastingPhotos(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[#0A0A0A] border border-white/15 rounded-sm p-6 max-w-4xl w-full relative space-y-4 max-h-[90vh] overflow-y-auto"
+            >
+              <button
+                type="button"
+                onClick={() => setPreviewCastingPhotos(null)}
+                className="absolute top-4 right-4 p-2 text-zinc-400 hover:text-white transition-colors cursor-pointer z-10 bg-black/60 rounded-full"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <div className="text-center">
+                <h3 className="text-lg font-bold text-white uppercase tracking-wider">
+                  {previewCastingPhotos.nombre}
+                </h3>
+                <p className="text-xs text-[#E2BA57] mt-0.5">Gestión de Postulante · Fotografías de Casting</p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+                <div className="space-y-2">
+                  <p className="text-xs font-bold text-zinc-300 uppercase tracking-wider text-center">1. Foto de Cara (Actitud)</p>
+                  <div className="bg-black border border-white/15 rounded-sm overflow-hidden aspect-[4/5] flex items-center justify-center">
+                    {previewCastingPhotos.cara ? (
+                      <ProtectedCastingPhoto
+                        src={previewCastingPhotos.cara}
+                        alt="Cara"
+                        className="w-full h-full object-contain"
+                        accessToken={castingAccessToken}
+                      />
+                    ) : (
+                      <span className="text-xs text-zinc-500">Sin foto de cara</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <p className="text-xs font-bold text-zinc-300 uppercase tracking-wider text-center">2. Foto de Cuerpo Completo</p>
+                  <div className="bg-black border border-white/15 rounded-sm overflow-hidden aspect-[4/5] flex items-center justify-center">
+                    {previewCastingPhotos.cuerpo ? (
+                      <ProtectedCastingPhoto
+                        src={previewCastingPhotos.cuerpo}
+                        alt="Cuerpo"
+                        className="w-full h-full object-contain"
+                        accessToken={castingAccessToken}
+                      />
+                    ) : (
+                      <span className="text-xs text-zinc-500">Sin foto de cuerpo</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
         )}
       </AnimatePresence>
     </div>
